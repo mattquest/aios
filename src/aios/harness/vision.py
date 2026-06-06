@@ -78,6 +78,12 @@ def supports_vision(model: str) -> bool:
         return _VISION_OVERRIDES[model]
     if "claude" in model.lower():
         return True
+    # Grok 4.x is multimodal but absent from litellm's model catalog, so the
+    # get_model_info lookup below raises "isn't mapped yet" and collapses to
+    # no-vision — silently degrading image reads to a text marker. Assert the
+    # family by name (same rationale as the Claude match above).
+    if "grok-4" in model.lower():
+        return True
     # Defer the heavy ``litellm`` import: every harness consumer of this
     # module pays ~1.18s of bootstrap otherwise, and most call sites never
     # reach this branch (Claude short-circuits above).
