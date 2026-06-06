@@ -457,8 +457,22 @@ async def _run_session_step_body(
     )
 
     if channels:
-        from aios.harness.channels import apply_monologue_prefix
+        from aios.harness.channels import apply_monologue_prefix, autodeliver_focal_text
 
+        # Auto-deliver a bare-text focal-channel reply. Some models don't
+        # reliably call the connector send tool, so their replies would vanish
+        # as monologue; synthesize the send when the model produced substantive
+        # text with no tool calls of its own. Runs BEFORE the monologue prefix
+        # so a delivered reply isn't also tagged as monologue.
+        _tool_names = {
+            t["function"]["name"]
+            for t in (tools or [])
+            if isinstance(t, dict)
+            and t.get("type") == "function"
+            and isinstance(t.get("function"), dict)
+            and "name" in t["function"]
+        }
+        assistant_msg = autodeliver_focal_text(assistant_msg, session.focal_channel, _tool_names)
         assistant_msg = apply_monologue_prefix(assistant_msg)
 
     # Record the seq of the latest user/tool event in the context this
