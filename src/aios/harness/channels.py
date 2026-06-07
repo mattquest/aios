@@ -10,8 +10,6 @@ event-log lookup lives in :func:`aios.services.channels.list_session_channels`.
 
 from __future__ import annotations
 
-import json
-import uuid
 from collections.abc import Iterable
 from typing import Any
 
@@ -349,61 +347,3 @@ def apply_monologue_prefix(assistant_msg: dict[str, Any]) -> dict[str, Any]:
                 new_blocks.append(block)
         return {**assistant_msg, "content": new_blocks}
     return assistant_msg
-
-
-def _primary_text(content: Any) -> str:
-    """The assistant message's main text — str content, or its first text block."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                return block.get("text", "") or ""
-    return ""
-
-
-def _has_alnum(text: str) -> bool:
-    """True when the text carries real content (a letter or digit) rather than
-    just punctuation/whitespace — e.g. the degenerate ``.`` monologue is not."""
-    return any(ch.isalnum() for ch in (text or ""))
-
-
-def autodeliver_focal_text(
-    assistant_msg: dict[str, Any],
-    focal_channel: str | None,
-    available_tool_names: set[str],
-) -> dict[str, Any]:
-    """Deliver a bare-text reply to the focal channel as a connector send.
-
-    aios's channel model requires the model to call a connector send tool
-    (e.g. ``signal_send``) to speak; bare assistant text is internal monologue
-    that reaches no one. Models that don't reliably make that call have their
-    replies silently vanish — and the monologue-tagged turns can seed a
-    degenerate self-mimicry loop.
-
-    When the session has a focal channel and the assistant produced
-    *substantive* text with NO tool calls of its own, synthesize the focal
-    connector's ``<connector>_send`` call carrying that text, so the reply is
-    delivered. The text is moved into the tool call and cleared from
-    ``content`` so it isn't also rendered as monologue.
-
-    No-op (returns unchanged) when there's no focal channel; the assistant
-    already made tool calls (it's driving itself — including calling the send
-    tool, switch_channel, or read); the text isn't substantive; or the focal
-    connector exposes no ``_send`` tool this step. Safe for well-behaved models
-    (they have tool_calls), so it only ever helps a model that forgot to send.
-    """
-    if not focal_channel or assistant_msg.get("tool_calls"):
-        return assistant_msg
-    text = _primary_text(assistant_msg.get("content"))
-    if not _has_alnum(text):
-        return assistant_msg
-    send_tool = f"{focal_channel.split('/', 1)[0]}_send"
-    if send_tool not in available_tool_names:
-        return assistant_msg
-    tool_call = {
-        "id": f"call-autodeliver-{uuid.uuid4().hex[:24]}",
-        "type": "function",
-        "function": {"name": send_tool, "arguments": json.dumps({"text": text.strip()})},
-    }
-    return {**assistant_msg, "content": "", "tool_calls": [tool_call]}
