@@ -456,9 +456,34 @@ async def _run_session_step_body(
         account_id=account_id,
     )
 
+    silence: dict[str, Any] | None = None
     if channels:
-        from aios.harness.channels import apply_monologue_prefix
+        from aios.harness.channels import (
+            apply_monologue_prefix,
+            autodeliver_focal_text,
+            strip_stay_silent,
+        )
 
+        # The channel delivery contract, in precedence order: an explicit
+        # stay_silent call wins (stripped here — it must never dispatch or
+        # linger in the log; the lifecycle event below is the audit trail);
+        # otherwise bare substantive text is speech and is auto-delivered
+        # to the focal channel as a connector send; whatever text remains
+        # (monologue-prefixed thinking, text alongside tool calls) is
+        # tagged as internal monologue.
+        assistant_msg, silence = strip_stay_silent(assistant_msg)
+        if silence is None:
+            _tool_names = {
+                t["function"]["name"]
+                for t in (tools or [])
+                if isinstance(t, dict)
+                and t.get("type") == "function"
+                and isinstance(t.get("function"), dict)
+                and "name" in t["function"]
+            }
+            assistant_msg = autodeliver_focal_text(
+                assistant_msg, session.focal_channel, _tool_names
+            )
         assistant_msg = apply_monologue_prefix(assistant_msg)
 
     # Record the seq of the latest user/tool event in the context this
@@ -471,6 +496,19 @@ async def _run_session_step_body(
     await sessions_service.append_event(
         pool, session_id, "message", assistant_msg, account_id=account_id
     )
+
+    if silence is not None:
+        # Lifecycle, not a tool_result: results are inference stimulus and
+        # would re-fire the step (silence-acknowledgement loop); lifecycle
+        # events are invisible to ``find_sessions_needing_inference``.
+        data: dict[str, Any] = {"event": "stayed_silent"}
+        reason = silence.get("reason")
+        if isinstance(reason, str) and reason:
+            data["reason"] = reason
+        await sessions_service.append_event(
+            pool, session_id, "lifecycle", data, account_id=account_id
+        )
+        log.info("step.stayed_silent", session_id=session_id, reason=reason)
 
     # Partition tool calls into dispatch buckets. Immediate builtin/MCP
     # launch now; ``needs_confirm`` and ``custom`` sit unresolved in the
@@ -554,17 +592,18 @@ async def _run_session_step_body(
     return None
 
 
-def _switch_channel_tool_spec() -> dict[str, Any]:
-    """Build the chat-completions tool entry for the ``switch_channel`` built-in.
+def _injected_tool_spec(name: str) -> dict[str, Any]:
+    """Build the chat-completions tool entry for an injected built-in.
 
-    Injected unconditionally into the tool list when the session has
-    any bound channels (see ``run_session_step``).  Agents don't need
-    to list it in their ``tools`` declaration — it's focal-machinery
-    scope, not agent scope.
+    ``switch_channel`` and ``stay_silent`` are injected into the tool
+    list whenever the session has bound channels (see
+    ``compute_step_prelude``).  Agents don't need to list them in their
+    ``tools`` declaration — they're focal-machinery scope, not agent
+    scope.
     """
     from aios.tools.registry import registry as tool_registry
 
-    tool = tool_registry.get("switch_channel")
+    tool = tool_registry.get(name)
     return {
         "type": "function",
         "function": {

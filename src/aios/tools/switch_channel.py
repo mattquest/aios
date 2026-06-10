@@ -56,10 +56,10 @@ SWITCH_CHANNEL_DESCRIPTION = (
     "On a real switch the tool result includes a recap block: peer "
     "inbound messages on the target channel plus the tool_calls you "
     "made while focused there (which is where your outbound sends live "
-    "— e.g. signal_send arguments). Your bare assistant text is "
-    "internal monologue and is dropped from recaps. A call whose "
-    "channel_id already equals your current focal is a no-op — no "
-    "recap, no re-emit."
+    "— e.g. signal_send arguments, including auto-delivered plain-text "
+    "replies). Monologue-prefixed assistant text is internal and is "
+    "dropped from recaps. A call whose channel_id already equals your "
+    "current focal is a no-op — no recap, no re-emit."
 )
 
 SWITCH_CHANNEL_PARAMETERS_SCHEMA: dict[str, Any] = {

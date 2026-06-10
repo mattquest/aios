@@ -161,7 +161,7 @@ async def compute_step_prelude(
         max_tail_block_local,
     )
     from aios.harness.loop import (
-        _switch_channel_tool_spec,
+        _injected_tool_spec,
         discover_session_mcp_tools,
     )
     from aios.harness.memory_stores import augment_with_memory_stores
@@ -169,10 +169,13 @@ async def compute_step_prelude(
     from aios.services import skills as skills_service
 
     tools = to_openai_tools(agent.tools)
-    # The switch_channel built-in is the agent's only path to mutate
-    # focal attention; inject it whenever the session has bound channels.
+    # Focal-machinery built-ins, injected whenever the session has bound
+    # channels: switch_channel is the agent's only path to mutate focal
+    # attention, stay_silent its explicit end-of-turn silence (the
+    # delivery contract's third leg — see autodeliver_focal_text).
     if channels:
-        tools.append(_switch_channel_tool_spec())
+        tools.append(_injected_tool_spec("switch_channel"))
+        tools.append(_injected_tool_spec("stay_silent"))
 
     mcp_servers_block = ""
     if agent.mcp_servers:
@@ -292,7 +295,7 @@ async def compose_step_context(
     "still executing in the background" wording; everything else
     (custom, awaiting-confirm) gets the "external action" wording.
     """
-    from aios.harness.channels import build_channels_tail_block
+    from aios.harness.channels import build_channels_tail_block, drop_trivial_monologue
     from aios.services import sessions as sessions_service
 
     # Issue #630 follow-up: the renderer's ``/workspace`` attachment branch
@@ -317,6 +320,13 @@ async def compose_step_context(
         in_flight_tool_call_ids=in_flight_tool_call_ids,
     )
 
+    # Strip degenerate bare-"." monologue turns: some models (grok-4.3) emit a
+    # lone "." when idle and then mimic it into a silence spiral (measured ~90%
+    # repeat). Removing them from the model-facing context breaks the loop; they
+    # stay in the event log. Done before the tail blocks so the time/channels
+    # tail remains the literal last messages the focal-paradigm prose refers to.
+    ctx.messages[:] = drop_trivial_monologue(ctx.messages)
+
     # Tail blocks live *after* build_messages so their per-step mutations
     # (the current time; unread counts, previews) don't bust the prefix
     # cache.  Cache-stable prose stays in the system prompt above.
@@ -328,9 +338,17 @@ async def compose_step_context(
     if tail is not None:
         ctx.messages.append(tail)
 
-    # Block LiteLLM's adjacent-same-role merge on Anthropic so the tail
-    # isn't concatenated into the preceding user inbound.
-    messages = separate_adjacent_user_messages(ctx.messages)
+    # Block LiteLLM's adjacent-same-role merge on Anthropic so the tail isn't
+    # concatenated into the preceding user inbound. The separator is a bare "."
+    # assistant turn, needed ONLY for providers that merge adjacent same-role
+    # messages (Anthropic's translator). The openai provider (e.g. grok via
+    # api.x.ai) passes adjacent user messages through unchanged, so the
+    # separator is unnecessary there — and grok-4.3 MIMICS that injected "."
+    # into a turn-1 silence collapse (~80%, measured). Skip it for openai.
+    if agent.model.startswith("openai/"):
+        messages = ctx.messages
+    else:
+        messages = separate_adjacent_user_messages(ctx.messages)
 
     # Unblock thinking-mode models: DeepSeek V4 Flash rejects assistant
     # turns without reasoning_content.  Empty stub is ignored by all

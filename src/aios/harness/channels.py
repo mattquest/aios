@@ -10,6 +10,8 @@ event-log lookup lives in :func:`aios.services.channels.list_session_channels`.
 
 from __future__ import annotations
 
+import json
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
@@ -121,17 +123,25 @@ def build_focal_paradigm_block(channels: list[str]) -> str:
         "When focused on a channel, the connector's response tools "
         "(e.g. `signal_send`, `signal_react`) operate on your focal "
         "channel implicitly — no channel/chat-id argument required. "
-        "Bare assistant text is NOT delivered to any channel — it is "
-        "private thinking no human sees. Prefix any such thinking with "
-        f"{MONOLOGUE_PREFIX.strip()!r} so it is unambiguous in your "
-        "history that you understood it was internal.\n"
+        "Plain assistant text you emit while a channel is focal is "
+        "DELIVERED to that channel automatically — text is speech. "
+        "Use the send tools when you need platform features (reactions, "
+        "replies, attachments); plain text suffices for an ordinary "
+        "reply. With no focal channel ('phone down'), bare text reaches "
+        "no one. To think privately without speaking, prefix the text "
+        f"with {MONOLOGUE_PREFIX.strip()!r} — prefixed text is never "
+        "delivered.\n"
         "\n"
-        "### Timing\n"
+        "### Staying silent\n"
         "\n"
         "Tools run asynchronously — new user messages can arrive while "
         "a tool is in flight, and you will see them on your next step. "
-        "There is no obligation to respond on every step; silence is "
-        "the right choice when there is nothing new requiring a reply."
+        "There is no obligation to respond on every step. When nothing "
+        "new requires a reply, end your turn by calling `stay_silent` "
+        "(optionally with a short reason — recorded for the operator, "
+        "never delivered). Do NOT signal silence with empty or "
+        "punctuation-only text, and do not announce that you are "
+        "staying silent as deliverable text."
     )
 
 
@@ -347,3 +357,142 @@ def apply_monologue_prefix(assistant_msg: dict[str, Any]) -> dict[str, Any]:
                 new_blocks.append(block)
         return {**assistant_msg, "content": new_blocks}
     return assistant_msg
+
+
+def _is_trivial_monologue(msg: dict[str, Any]) -> bool:
+    """An assistant turn that is bare punctuation/whitespace (e.g. a lone
+    ``.``) — ignoring the monologue prefix — with no tool calls."""
+    if msg.get("role") != "assistant" or msg.get("tool_calls"):
+        return False
+    content = msg.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    else:
+        return False
+    if text.startswith(MONOLOGUE_PREFIX):
+        text = text[len(MONOLOGUE_PREFIX) :]
+    return not any(ch.isalnum() for ch in text)
+
+
+def _primary_text(content: Any) -> str:
+    """The assistant message's main text — str content, or its first text block.
+
+    The first text block is also where :func:`apply_monologue_prefix`
+    stamps, so the monologue opt-out check and the prefix stamp agree on
+    which text they are looking at.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text", "") or ""
+    return ""
+
+
+def _has_alnum(text: str) -> bool:
+    """True when the text carries real content (a letter or digit) rather than
+    just punctuation/whitespace — e.g. the degenerate ``.`` monologue is not."""
+    return any(ch.isalnum() for ch in (text or ""))
+
+
+def strip_stay_silent(
+    assistant_msg: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Remove ``stay_silent`` calls from an assistant message.
+
+    Returns ``(message, silence)`` where ``silence`` is the first
+    ``stay_silent`` call's parsed arguments (``{}`` when absent or
+    unparseable) — or ``None`` when the model didn't call it.
+
+    ``stay_silent`` is a turn-termination signal, not a real tool: it
+    must never dispatch (a tool_result event would be fresh stimulus and
+    re-fire the step — an infinite silence-acknowledgement loop) and the
+    call must not linger in the log (a result-less call reads as a ghost
+    to the repair sweep).  Stripping it here keeps the appended message
+    clean; the step body records a ``stayed_silent`` lifecycle event for
+    the audit trail.  Lifecycle events are not inference stimulus.
+
+    Other tool calls in the same message survive: ``stay_silent`` next
+    to real work (or a send — contradictory, the send wins) just means
+    the silence marker is dropped and the rest proceeds.
+    """
+    tool_calls = assistant_msg.get("tool_calls") or []
+    silence: dict[str, Any] | None = None
+    kept: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        if (tc.get("function") or {}).get("name") == "stay_silent":
+            if silence is None:
+                raw = (tc.get("function") or {}).get("arguments")
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) and raw else {}
+                except ValueError:
+                    parsed = {}
+                silence = parsed if isinstance(parsed, dict) else {}
+            continue
+        kept.append(tc)
+    if silence is None:
+        return assistant_msg, None
+    out = {**assistant_msg, "tool_calls": kept}
+    if not kept:
+        del out["tool_calls"]
+    return out, silence
+
+
+def autodeliver_focal_text(
+    assistant_msg: dict[str, Any],
+    focal_channel: str | None,
+    available_tool_names: set[str],
+) -> dict[str, Any]:
+    """Deliver a bare-text reply to the focal channel as a connector send.
+
+    The channel delivery contract: connector send tools speak, plain
+    assistant text on a focal channel is speech too, and silence is the
+    explicit ``stay_silent`` call.  This helper implements the middle
+    leg — when the session has a focal channel and the assistant
+    produced *substantive* text with NO tool calls of its own,
+    synthesize the focal connector's ``<connector>_send`` call carrying
+    that text, so the reply is delivered.  The text moves into the tool
+    call and ``content`` is cleared so it isn't also rendered as
+    monologue.
+
+    No-op (returns unchanged) when: there's no focal channel; the
+    assistant made tool calls (it's driving itself — including calling
+    the send tool, stay_silent, or any work tool); the text isn't
+    substantive (the degenerate bare-``.`` turn); the text opts out with
+    the :data:`MONOLOGUE_PREFIX` (explicitly private thinking); or the
+    focal connector exposes no ``_send`` tool this step.
+    """
+    if not focal_channel or assistant_msg.get("tool_calls"):
+        return assistant_msg
+    text = _primary_text(assistant_msg.get("content"))
+    if not _has_alnum(text) or text.lstrip().startswith(MONOLOGUE_PREFIX.strip()):
+        return assistant_msg
+    send_tool = f"{focal_channel.split('/', 1)[0]}_send"
+    if send_tool not in available_tool_names:
+        return assistant_msg
+    tool_call = {
+        "id": f"call-autodeliver-{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": send_tool, "arguments": json.dumps({"text": text.strip()})},
+    }
+    return {**assistant_msg, "content": "", "tool_calls": [tool_call]}
+
+
+def drop_trivial_monologue(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip degenerate bare-``.`` assistant turns from the model-facing context.
+
+    Some models (notably grok-4.3) emit a bare ``.`` when they have nothing to
+    say, then *mimic* it on subsequent turns — a self-reinforcing collapse into
+    silence (measured: one ``.`` in context → ~90% repeat; removing it → 100%
+    normal engagement). These turns carry no information and were never
+    delivered to anyone, so they are dropped from what the model sees each step;
+    they remain in the event log. Only assistant turns with NO tool calls and no
+    alphanumeric content are removed — substantive monologue and every
+    tool-calling turn are kept. Deterministic per message, so the rendered
+    context stays a monotonic function of the log (prompt-cache safe)."""
+    return [m for m in messages if not _is_trivial_monologue(m)]

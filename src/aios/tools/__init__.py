@@ -31,6 +31,7 @@ from aios.tools import schedule_task_remove as _schedule_task_remove  # noqa: F4
 from aios.tools import schedule_task_update as _schedule_task_update  # noqa: F401
 from aios.tools import schedule_wake as _schedule_wake  # noqa: F401
 from aios.tools import search_events as _search_events  # noqa: F401
+from aios.tools import stay_silent as _stay_silent  # noqa: F401
 from aios.tools import switch_channel as _switch_channel  # noqa: F401
 from aios.tools import wake_self as _wake_self  # noqa: F401
 from aios.tools import wake_session as _wake_session  # noqa: F401
