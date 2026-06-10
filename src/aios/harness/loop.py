@@ -146,7 +146,7 @@ async def run_session_step(
             # proceed (matches what the body's litellm-error handler does).
             log.exception("step.job_timeout", session_id=session_id, timeout=_JOB_TIMEOUT_S)
             retry_delay = await _handle_step_timeout(pool, session_id, account_id=account_id)
-        except Exception:
+        except Exception as exc:
             # Unexpected harness error (not a model/tool error — those are caught
             # inside _run_session_step_body). Emit a span so the event log has a
             # record, then apply the retry-or-failure state machine identically to
@@ -156,10 +156,21 @@ async def run_session_step(
                 pool,
                 session_id,
                 "span",
-                {"event": "harness_error", "is_error": True},
+                {
+                    "event": "harness_error",
+                    "is_error": True,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:500],
+                },
                 account_id=account_id,
             )
-            retry_delay = await _apply_retry_or_failure(pool, session_id, account_id=account_id)
+            retry_delay = await _apply_retry_or_failure(
+                pool,
+                session_id,
+                account_id=account_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc)[:500],
+            )
             if retry_delay is None:
                 raise
     finally:
@@ -406,7 +417,7 @@ async def _run_session_step_body(
                 extra=agent.litellm_extra or None,
                 session_id=session_id,
             )
-    except Exception:
+    except Exception as exc:
         log.exception("step.litellm_failed", session_id=session_id)
         await sessions_service.append_event(
             pool,
@@ -416,12 +427,20 @@ async def _run_session_step_body(
                 "event": "model_request_end",
                 "model_request_start_id": start_event.id,
                 "is_error": True,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:500],
                 "model_usage": {},
                 "cost_usd": None,
             },
             account_id=account_id,
         )
-        return await _apply_retry_or_failure(pool, session_id, account_id=account_id)
+        return await _apply_retry_or_failure(
+            pool,
+            session_id,
+            account_id=account_id,
+            error_type=type(exc).__name__,
+            error_message=str(exc)[:500],
+        )
 
     # ``local_tokens`` costs the full payload (messages + tools) so it
     # matches what the provider counts.  The error branch above stays
@@ -891,15 +910,34 @@ async def _dispatch_confirmed_tools(
     return pending
 
 
-async def _apply_retry_or_failure(pool: Any, session_id: str, *, account_id: str) -> float | None:
+async def _apply_retry_or_failure(
+    pool: Any,
+    session_id: str,
+    *,
+    account_id: str,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> float | None:
     """Apply the rescheduling state when backoff budget allows; otherwise
     mark a terminal error.
 
     Returns the retry delay (seconds) when a retry will be deferred, or
     ``None`` when the budget is spent and the session ends in error
-    state.  Both branches advance the session's lifecycle and status;
+    state.  Both branches advance the session's lifecycle and status —
+    stamping ``error_type`` / ``error_message`` on the lifecycle event so
+    the failure is diagnosable from the log and renderable by clients;
     the caller decides whether to also propagate an exception.
+
+    The terminal branch additionally narrates the failure to the
+    session's focal channel (best-effort) — a parked assistant must not
+    be indistinguishable from a silent one.
     """
+    error_fields: dict[str, Any] = {}
+    if error_type:
+        error_fields["error_type"] = error_type
+    if error_message:
+        error_fields["error_message"] = error_message
+
     attempt = await _count_consecutive_rescheduling(pool, session_id, account_id=account_id)
     delay = _retry_delay_for_attempt(attempt)
     if delay is not None:
@@ -913,6 +951,7 @@ async def _apply_retry_or_failure(pool: Any, session_id: str, *, account_id: str
             "rescheduling",
             "rescheduling",
             account_id=account_id,
+            extra=error_fields,
         )
         return delay
     # Terminal landing pad (#353): the ``turn_ended``/``error`` lifecycle event
@@ -924,9 +963,141 @@ async def _apply_retry_or_failure(pool: Any, session_id: str, *, account_id: str
         pool, session_id, {"type": "error"}, account_id=account_id
     )
     await _append_lifecycle(
-        pool, session_id, "turn_ended", "errored", "error", account_id=account_id
+        pool,
+        session_id,
+        "turn_ended",
+        "errored",
+        "error",
+        account_id=account_id,
+        extra=error_fields,
     )
+    try:
+        await _narrate_terminal_failure(
+            pool, session_id, account_id=account_id, error_type=error_type
+        )
+    except Exception:
+        # Narration is best-effort: a failure here must never mask the
+        # terminal state already recorded above.
+        log.exception("step.failure_narration_failed", session_id=session_id)
     return None
+
+
+def _failure_text(error_type: str | None) -> str:
+    """Plain-language failure copy for the user's channel.
+
+    Maps the recorded exception class onto words a non-technical user
+    can act on; the full detail stays in the event log for the console.
+    """
+    name = error_type or ""
+    if "Authentication" in name or "PermissionDenied" in name:
+        cause = "my AI model provider rejected my credentials"
+    elif "RateLimit" in name:
+        cause = "my AI model provider is rate-limiting me"
+    elif "ContextWindow" in name:
+        cause = "this conversation overflowed my model's context window"
+    elif "Budget" in name:
+        cause = "my model spending limit was reached"
+    elif any(
+        s in name
+        for s in (
+            "Timeout",
+            "Connection",
+            "ServiceUnavailable",
+            "InternalServer",
+            "APIError",
+            "StepTimeout",
+        )
+    ):
+        cause = "I can't reach my AI model right now"
+    else:
+        cause = "something went wrong while I was generating a reply"
+    detail = f" (technical detail: {error_type})" if error_type else ""
+    return (
+        f"⚠️ I'm having trouble: {cause}. I retried a few times and have "
+        f"stopped for now — message me again and I'll pick it back up. "
+        f"If this keeps happening, my operator should check the session "
+        f"log.{detail}"
+    )
+
+
+async def _narrate_terminal_failure(
+    pool: Any,
+    session_id: str,
+    *,
+    account_id: str,
+    error_type: str | None,
+) -> None:
+    """Tell the focal channel the session has parked in the errored state.
+
+    Appends a synthetic assistant message whose only tool call is the
+    focal connector's ``<connector>_send`` carrying plain-language
+    failure copy. ``append_event`` fans the call out to the bound
+    connector runtime exactly like a model-made send — and the runtime's
+    subscribe-time backfill reads pending calls off the latest assistant
+    message, so the narration is delivered even if the connector is down
+    right now and comes back later.
+
+    The message carries the previous assistant watermark as its
+    ``reacting_to`` so it doesn't absorb unreacted stimulus (the gate
+    would otherwise treat everything before it as handled). Its send's
+    tool_result cannot un-park the session: recovery requires a
+    ``role='user'`` event (see ``sweep.ERRORED_SESSIONS_SQL``).
+
+    No focal channel, or no ``_send`` tool on the session's connections
+    → nothing to narrate into; the error stays visible via the lifecycle
+    event and session ``stop_reason``.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    from aios.db import queries
+    from aios.harness import runtime as harness_runtime
+
+    async with pool.acquire() as conn:
+        focal = await queries.get_session_focal_channel(conn, session_id, account_id=account_id)
+    if not focal:
+        return
+    send_tool = f"{focal.split('/', 1)[0]}_send"
+    connection_tools = await harness_runtime.require_tool_provider().list_tools_for_session(
+        pool, session_id
+    )
+    if send_tool not in {t.get("name") for t in connection_tools}:
+        return
+
+    # Preserve the inference watermark: without an explicit reacting_to,
+    # the gate derives this message's own seq as "everything before me is
+    # handled", swallowing any user message that arrived mid-failure.
+    watermark = 0
+    recent = await sessions_service.read_events(
+        pool, session_id, kind="message", newest_first=True, limit=50, account_id=account_id
+    )
+    for e in recent:
+        if e.data.get("role") == "assistant":
+            watermark = e.data.get("reacting_to") or e.seq
+            break
+
+    await sessions_service.append_event(
+        pool,
+        session_id,
+        "message",
+        {
+            "role": "assistant",
+            "content": "",
+            "reacting_to": watermark,
+            "tool_calls": [
+                {
+                    "id": f"call-failnarrate-{_uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": send_tool,
+                        "arguments": _json.dumps({"text": _failure_text(error_type)}),
+                    },
+                }
+            ],
+        },
+        account_id=account_id,
+    )
+    log.info("step.failure_narrated", session_id=session_id, channel=focal, error_type=error_type)
 
 
 async def _handle_step_timeout(pool: Any, session_id: str, *, account_id: str) -> float | None:
@@ -938,7 +1109,13 @@ async def _handle_step_timeout(pool: Any, session_id: str, *, account_id: str) -
         {"event": "step_timeout", "timeout_seconds": _JOB_TIMEOUT_S, "is_error": True},
         account_id=account_id,
     )
-    return await _apply_retry_or_failure(pool, session_id, account_id=account_id)
+    return await _apply_retry_or_failure(
+        pool,
+        session_id,
+        account_id=account_id,
+        error_type="StepTimeout",
+        error_message=f"step exceeded the {_JOB_TIMEOUT_S:.0f}s job-level cap",
+    )
 
 
 async def _count_consecutive_rescheduling(pool: Any, session_id: str, *, account_id: str) -> int:
@@ -975,12 +1152,18 @@ async def _append_lifecycle(
     stop_reason: str,
     *,
     account_id: str,
+    extra: dict[str, Any] | None = None,
 ) -> None:
-    """Append a lifecycle event."""
+    """Append a lifecycle event. ``extra`` merges additional fields into
+    the event data (e.g. ``error_type`` / ``error_message`` on failure
+    turns) without disturbing the three canonical keys."""
+    data: dict[str, Any] = {"event": event, "status": status, "stop_reason": stop_reason}
+    if extra:
+        data.update(extra)
     await sessions_service.append_event(
         pool,
         session_id,
         "lifecycle",
-        {"event": event, "status": status, "stop_reason": stop_reason},
+        data,
         account_id=account_id,
     )
