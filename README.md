@@ -138,28 +138,32 @@ docker run -d --name aios-pg -p 5433:5432 \
 #   docker build -t aios-sandbox:latest -f docker/Dockerfile.sandbox docker/
 #   export AIOS_DOCKER_IMAGE=aios-sandbox:latest
 
-# Configure
-cat > .env << 'EOF'
-AIOS_API_KEY=your-secret-key
+# Configure (unquoted EOF: the vault key is generated once, at file-creation time)
+cat > .env << EOF
 AIOS_VAULT_KEY=$(python3 -c "import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())")
 AIOS_DB_URL=postgresql://aios:aios@localhost:5433/aios
 AIOS_API_PORT=8090
 EOF
 
-# Migrate (applies alembic + procrastinate schema + aios triggers)
+# Migrate (applies alembic + procrastinate schema + aios triggers).
+# On a fresh database this also mints the root account and prints your
+# AIOS_API_KEY — exactly once. Copy it into .env:
 set -a && source .env && set +a
 uv run aios migrate
+echo 'AIOS_API_KEY=<the key migrate printed>' >> .env
+set -a && source .env && set +a
 
 # Start (two processes)
 uv run aios api      # API server
 uv run aios worker   # Worker process
 
-# Quickest path: use the CLI client
+# Quickest path: use the CLI client (reads AIOS_URL/AIOS_API_KEY from env or .env)
 export AIOS_URL=http://localhost:8090
-export AIOS_API_KEY=your-secret-key
 
-uv run aios envs create --name default
-uv run aios agents create --file - <<'EOF'
+uv run aios status   # reachability + auth check — fix this first if it fails
+
+uv run aios envs create --data '{"name": "default"}'
+uv run aios agents create --stdin <<'EOF'
 {
   "name": "assistant",
   "model": "openrouter/anthropic/claude-sonnet-4-6",
@@ -199,7 +203,7 @@ docker compose --profile signal up
 
 The bootstrap script is idempotent — re-runs are a no-op once a connector's token is in `.env`. Use `./scripts/dev-bootstrap.sh --reset` to wipe generated keys + tokens and start fresh (useful after rotating credentials or when handing the worktree to another developer).
 
-**Connector tokens are returned ONCE** by `POST /v1/connector-tokens` and never readable thereafter. The bootstrap script captures them into `.env`. If `.env` is lost, run `--reset` to issue new ones.
+**Runtime tokens are returned ONCE** by `POST /v1/runtime-tokens` (CLI: `aios runtime-tokens issue`) and never readable thereafter. The bootstrap script captures them into `.env`. If `.env` is lost, run `--reset` for a fresh stack (destructive: drops the dev database) or issue replacements with `aios runtime-tokens issue`.
 
 ### Operator notes
 
@@ -369,7 +373,8 @@ All aios settings use the `AIOS_` prefix (Pydantic settings):
 
 | Variable | Purpose |
 |---|---|
-| `AIOS_API_KEY` | Bearer auth key (required) |
+| `AIOS_API_KEY` | Bearer auth key (required). Must be a DB-minted account key: on a fresh database `aios migrate` mints the root account and prints the key once. A made-up value 401s every request. |
+| `AIOS_BOOTSTRAP_TOKEN` | Optional alternative to migrate-minting: gates `POST /v1/accounts/bootstrap` for minting the root key over HTTP (containerized setups) |
 | `AIOS_VAULT_KEY` | Base64-encoded 32-byte libsodium key (required; **don't regenerate** if Postgres has encrypted data) |
 | `AIOS_DB_URL` | Postgres connection string (required) |
 | `AIOS_API_HOST` / `AIOS_API_PORT` | API bind address (default `127.0.0.1:8080`) |

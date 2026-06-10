@@ -372,3 +372,95 @@ jobs:
             --ignore=tests/e2e/test_signal_connector.py \
             --ignore=tests/e2e/test_signal_registration.py \
             --ignore=tests/e2e/test_telegram_connector.py
+
+  # Doc-drift guard for the README Quickstart: the exact first-run path a
+  # new user walks — fresh DB, `aios migrate` mints + prints the root key,
+  # API starts, `aios status` authenticates, and the documented create
+  # commands run as written. Every step here has shipped broken before
+  # (silent-401 placeholder keys, `envs create --name`, `agents create
+  # --file -`); this job makes that class of drift a red build.
+  quickstart-smoke:
+    needs: detect
+    if: needs.detect.outputs.run_checks == 'true'
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: aios
+          POSTGRES_PASSWORD: aios
+          POSTGRES_DB: aios_quickstart
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      AIOS_DB_URL: postgresql://aios:aios@localhost:5432/aios_quickstart
+      AIOS_VAULT_KEY: 5Uvx6pICqEEpPDl+1f5SrKyXOoQA5j0XcYD590hZH/Y=
+      AIOS_API_PORT: "8090"
+      AIOS_URL: http://localhost:8090
+      # AIOS_API_KEY deliberately NOT set: the fresh-DB migrate must mint it.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.13
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Quickstart — migrate mints the root key on a fresh DB
+        run: |
+          set -euo pipefail
+          out="$(uv run aios migrate)"
+          printf '%s\n' "$out"
+          key="$(printf '%s\n' "$out" | sed -n 's/.*AIOS_API_KEY: //p' | tr -d '[:space:]')"
+          if [ -z "$key" ]; then
+            echo "::error::aios migrate did not mint a root key on a fresh database"
+            exit 1
+          fi
+          echo "AIOS_API_KEY=$key" >> "$GITHUB_ENV"
+          echo "::add-mask::$key"
+
+      - name: Quickstart — second migrate must not mint again
+        run: |
+          set -euo pipefail
+          out="$(uv run aios migrate)"
+          if printf '%s\n' "$out" | grep -q 'AIOS_API_KEY:'; then
+            echo "::error::aios migrate minted a second root key on a non-empty database"
+            exit 1
+          fi
+
+      - name: Quickstart — start API, auth check, documented create commands
+        run: |
+          set -euo pipefail
+          uv run aios api &
+          api_pid=$!
+          trap 'kill "$api_pid"' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:8090/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://localhost:8090/health >/dev/null
+          uv run aios status
+          uv run aios envs create --data '{"name": "default"}'
+          echo '{"name": "assistant", "model": "openrouter/anthropic/claude-sonnet-4-6", "system": "You are a helpful assistant.", "tools": [{"type": "search_events"}]}' \
+            | uv run aios agents create --stdin
+          uv run aios agents list
+          # With a root account in place, a bogus key must get the uniform
+          # invalid-key message (the "no accounts exist" hint is fresh-DB only).
+          body="$(curl -s -H 'Authorization: Bearer bogus-key' http://localhost:8090/v1/agents)"
+          printf '%s\n' "$body" | grep -q 'invalid api key' || {
+            echo "::error::expected uniform invalid-key 401, got: $body"
+            exit 1
+          }

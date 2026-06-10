@@ -18,8 +18,11 @@
 #       --connector to bootstrap multiple at once.
 #
 #   ./scripts/dev-bootstrap.sh --reset
-#       Wipe AIOS_API_KEY, AIOS_VAULT_KEY, all *_CONNECTOR_TOKEN values
-#       in .env, then run a fresh bootstrap.
+#       DESTRUCTIVE: docker compose down -v (drops the dev database),
+#       wipe AIOS_API_KEY, AIOS_VAULT_KEY, all *_CONNECTOR_TOKEN values
+#       in .env, then run a fresh bootstrap. The DB must go too: API keys
+#       are DB-minted and unrecoverable, so wiping .env alone would leave
+#       a database whose root key nobody knows.
 
 set -euo pipefail
 
@@ -137,27 +140,25 @@ PY
 }
 
 if $RESET; then
+  say "--reset: dropping the compose stack INCLUDING the database volume"
+  docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true
   say "--reset: clearing keys + tokens in .env"
   env_set AIOS_API_KEY ""
   env_set AIOS_VAULT_KEY ""
   env_set ECHO_HTTP_CONNECTOR_TOKEN ""
   env_set TELEGRAM_CONNECTOR_TOKEN ""
   env_set SIGNAL_CONNECTOR_TOKEN ""
-  ok ".env reset"
+  ok "stack + .env reset"
 fi
 
-# Generate keys lazily — only when their slot is empty or still the
-# .env.example placeholder.  openssl is on every macOS / Debian dev
-# host; refusing to fall back avoids surprising operators with Python's
-# secrets module producing a different format.
+# Generate the vault key lazily — only when its slot is empty or still the
+# .env.example placeholder.  AIOS_API_KEY is NOT generated here: auth keys
+# are DB-minted — `aios migrate` mints the root key on a fresh database and
+# this script captures it below.  (A made-up key would 401 every request.)
 needs_gen() {
   local v="$1"
   [[ -z "$v" || "$v" == "replace-me" ]]
 }
-if needs_gen "$(env_get AIOS_API_KEY)"; then
-  say "generating AIOS_API_KEY (openssl rand -hex 32)"
-  env_set AIOS_API_KEY "$(openssl rand -hex 32)"
-fi
 if needs_gen "$(env_get AIOS_VAULT_KEY)"; then
   say "generating AIOS_VAULT_KEY (openssl rand -base64 32)"
   env_set AIOS_VAULT_KEY "$(openssl rand -base64 32)"
@@ -205,8 +206,25 @@ done
 ok "postgres healthy"
 
 say "running migrations"
-docker compose run --rm migrate >/dev/null
+migrate_out="$(docker compose run --rm migrate 2>&1)" || {
+  printf '%s\n' "$migrate_out" >&2
+  fail "migrate failed"
+}
 ok "migrations applied"
+
+# On a fresh database, migrate mints the root account and prints the
+# AIOS_API_KEY exactly once — capture it into .env. On an existing
+# database nothing is printed and the .env value is kept as-is.
+minted_key="$(printf '%s\n' "$migrate_out" | sed -n 's/.*AIOS_API_KEY: //p' | tr -d '[:space:]')"
+if [[ -n "$minted_key" ]]; then
+  env_set AIOS_API_KEY "$minted_key"
+  export AIOS_API_KEY="$minted_key"
+  ok "captured freshly minted AIOS_API_KEY into .env"
+elif [[ -z "$(env_get AIOS_API_KEY)" ]]; then
+  fail "database already has a root account but .env has no AIOS_API_KEY — \
+the key is unrecoverable by design. Run --reset for a fresh stack, or mint \
+a new key via POST /v1/accounts/keys with an existing credential."
+fi
 
 say "starting api"
 docker compose up -d api >/dev/null
@@ -221,11 +239,10 @@ done
 curl -fsS "$api_url_local" >/dev/null 2>&1 || fail "api didn't reach /health in 60s"
 ok "api healthy"
 
-# Seed the deterministic dev key the console auto-logs-in with. Best-effort:
-# on a brand-new DB there's no root yet, so the seed no-ops with a hint and we
-# continue (the console's first-run bootstrap creates the root, after which a
-# re-run of dev-bootstrap seeds the key).
-"$SCRIPT_DIR/dev-seed-console-key.sh" || say "dev console key not seeded yet (see hint above)"
+# Seed the deterministic dev key the console auto-logs-in with. The root
+# account exists by now (migrate mints it on a fresh DB), so this succeeds
+# on first run; best-effort so a seeding hiccup doesn't kill bootstrap.
+"$SCRIPT_DIR/dev-seed-console-key.sh" || say "dev console key not seeded (see hint above)"
 
 # ── helpers for connection creation ───────────────────────────────────
 # Find the connection id for (connector, account) if one already exists,
@@ -239,7 +256,7 @@ find_connection_id() {
 import json, sys
 account = sys.argv[1]
 for c in json.load(sys.stdin).get("data", []):
-    if c.get("account") == account:
+    if c.get("external_account_id") == account:
         print(c.get("id", "")); break
 ' "$account"
 }
@@ -259,7 +276,7 @@ create_or_get_connection() {
   if [[ -n "$existing" ]]; then
     echo "$existing"; return 0
   fi
-  local args=(connections create --connector "$connector" --account "$account")
+  local args=(connections create --connector "$connector" --external-account-id "$account")
   while (( $# )); do
     args+=(--secret "$1"); shift
   done
@@ -268,9 +285,9 @@ create_or_get_connection() {
 }
 
 issue_token() {
-  local connection_id="$1" label="$2"
-  uv run aios -f json connector-tokens issue \
-      --connection-id "$connection_id" --label "$label" \
+  local connector="$1" connection_id="$2" label="$3"
+  uv run aios -f json runtime-tokens issue \
+      --connector "$connector" --connection-id "$connection_id" --label "$label" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['plaintext'])"
 }
 
@@ -294,7 +311,7 @@ bootstrap_connector() {
   say "creating $connector connection (account=$account)"
   local conn_id token
   conn_id="$(create_or_get_connection "$connector" "$account" "$@")"
-  token="$(issue_token "$conn_id" "dev-bootstrap")"
+  token="$(issue_token "$connector" "$conn_id" "dev-bootstrap")"
   env_set "$slot" "$token"
   ok "$connector connection=$conn_id"
 }

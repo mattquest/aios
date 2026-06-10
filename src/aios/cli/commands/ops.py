@@ -52,7 +52,44 @@ def _run_migrate() -> int:
     db_url = get_settings().db_url
     upgrade_to_head(db_url)
     asyncio.run(apply_procrastinate_schema(db_url, verbose=True))
+    asyncio.run(_bootstrap_root_if_empty(db_url))
     return 0
+
+
+async def _bootstrap_root_if_empty(db_url: str) -> None:
+    """Mint the root account + first API key on a fresh database.
+
+    First-run self-service: auth requires a DB-minted account key, so a
+    fresh install with no accounts would 401 every request with no path
+    forward except the AIOS_BOOTSTRAP_TOKEN HTTP ceremony. Anyone who can
+    run migrations already owns the database, so minting here grants
+    nothing they didn't have. No-op when a root account exists; the
+    plaintext key is printed exactly once — it is unrecoverable after.
+    """
+    from aios.db import queries
+    from aios.db.pool import create_pool
+    from aios.services import accounts as accounts_service
+
+    pool = await create_pool(db_url, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            if await queries.has_active_root_account(conn):
+                return
+        response = await accounts_service.bootstrap_root(pool, display_name="root")
+        print(
+            "\n"
+            "════════════════════════════════════════════════════════════════\n"
+            " Fresh database — root account created.\n"
+            f"   account_id: {response.account_id}\n"
+            f"   AIOS_API_KEY: {response.plaintext_key}\n"
+            "\n"
+            " Put this key in your .env as AIOS_API_KEY (API server and\n"
+            " clients use the same value). It is shown ONLY this once;\n"
+            " if lost, mint a new key via POST /v1/accounts/keys.\n"
+            "════════════════════════════════════════════════════════════════\n"
+        )
+    finally:
+        await pool.close()
 
 
 def register(app: typer.Typer) -> None:

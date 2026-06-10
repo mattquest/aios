@@ -46,8 +46,8 @@ say "seeding dev console key onto the local root account"
 account_id="$(docker compose exec -T "$PG_SVC" psql -U aios -d aios -tA -c "$sql" 2>/dev/null | grep -oE 'acc_[A-Za-z0-9]+' | head -1)"
 
 if [[ -z "$account_id" ]]; then
-  warn "no root account yet — open the console and run first-run bootstrap (or"
-  warn "create a root via aios), then re-run this script to seed the dev key."
+  warn "no root account yet — run \`aios migrate\` (it mints the root account"
+  warn "on a fresh database), then re-run this script to seed the dev key."
   exit 1
 fi
 

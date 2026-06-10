@@ -71,8 +71,19 @@ async def require_bearer_auth(
         result = await queries.lookup_account_by_key_hash(
             conn, key_hash=accounts_service.hash_key(token)
         )
-    if result is None:
-        raise UnauthorizedError("invalid api key")
+        if result is None:
+            # Uniform message for all key states (unknown/revoked/archived)
+            # — but a database with NO accounts at all is a fresh install,
+            # not a credential probe target, and the silent-401 trap there
+            # is the #1 first-run dead end. Say what to do.
+            if not await queries.has_active_root_account(conn):
+                raise UnauthorizedError(
+                    "no accounts exist yet — this is a fresh database. "
+                    "Run `aios migrate` to mint the root account's API key "
+                    "(printed once), or POST /v1/accounts/bootstrap with "
+                    "AIOS_BOOTSTRAP_TOKEN."
+                )
+            raise UnauthorizedError("invalid api key")
     account, key_id = result
     return (account.id, key_id, account.can_mint_children)
 

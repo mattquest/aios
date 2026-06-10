@@ -101,11 +101,6 @@ NEEDS_CLI_TRACKED: dict[str, str] = {
     "list_memory_versions": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "get_memory_version": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "redact_memory_version": "needs CLI; tracked in aios#TBD (memory-stores group)",
-    # ── Runtime tokens (followup) ────────────────────────────────────
-    # Tracked: aios#TBD — single followup issue for `aios runtime-tokens ...`.
-    "list_runtime_tokens": "needs CLI; tracked in aios#TBD (runtime-tokens group)",
-    "issue_runtime_token": "needs CLI; tracked in aios#TBD (runtime-tokens group)",
-    "revoke_runtime_token": "needs CLI; tracked in aios#TBD (runtime-tokens group)",
     # ── Session resources / context (followup) ───────────────────────
     # Tracked: aios#TBD — extend `aios sessions` with `context`, `resources …`.
     "get_session_context": "needs CLI; tracked in aios#TBD (sessions context/resources)",

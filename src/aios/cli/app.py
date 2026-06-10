@@ -100,6 +100,7 @@ from aios.cli.commands import connections as _connections  # noqa: E402
 from aios.cli.commands import dev as _dev  # noqa: E402
 from aios.cli.commands import envs as _envs  # noqa: E402
 from aios.cli.commands import ops as _ops  # noqa: E402
+from aios.cli.commands import runtime_tokens as _runtime_tokens  # noqa: E402
 from aios.cli.commands import session_templates as _session_templates  # noqa: E402
 from aios.cli.commands import sessions as _sessions  # noqa: E402
 from aios.cli.commands import signal as _signal  # noqa: E402
@@ -116,6 +117,7 @@ app.add_typer(_session_templates.app, name="session-templates")
 app.add_typer(_skills.app, name="skills")
 app.add_typer(_vaults.app, name="vaults")
 app.add_typer(_connections.app, name="connections")
+app.add_typer(_runtime_tokens.app, name="runtime-tokens")
 app.add_typer(_envs.app, name="envs")
 app.add_typer(_dev.app, name="dev")
 app.add_typer(_signal.app, name="signal")
