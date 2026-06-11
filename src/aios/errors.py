@@ -81,13 +81,14 @@ class ForbiddenError(AiosError):
 
 
 class RateLimitedError(AiosError):
-    """Per-account resource cap exceeded.
+    """A rate or resource cap was exceeded.
 
-    Raised when a tenant has reached a per-account ceiling — currently
-    only the scheduled_tasks-per-account cap (see
-    ``Settings.scheduled_tasks_per_account_max``), but the type is
-    intentionally general so future caps (active sessions, MCP
-    connections, etc.) can reuse it.
+    Raised when a tenant has reached a per-account ceiling (the
+    scheduled_tasks-per-account cap, see
+    ``Settings.scheduled_tasks_per_account_max``) or a client exceeded
+    the HTTP request rate limit (``aios.api.rate_limit``, which also
+    sets ``Retry-After``). The type is intentionally general so future
+    caps (active sessions, MCP connections, etc.) can reuse it.
     """
 
     error_type = "rate_limited"

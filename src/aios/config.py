@@ -263,6 +263,21 @@ class Settings(BaseSettings):
     # ── api server ─────────────────────────────────────────────────────────
     api_host: str = Field(default="127.0.0.1")
     api_port: int = Field(default=8080, ge=1, le=65535)
+    api_rate_limit_per_minute: int = Field(
+        default=1200,
+        ge=0,
+        description="Per-client request ceiling for the HTTP API, in requests "
+        "per minute. Requests are keyed by bearer token (sha256 of the "
+        "Authorization header — one bucket per API key / runtime token) and "
+        "by client IP when unauthenticated. Token bucket: a full minute's "
+        "budget can be spent in a burst; sustained throughput refills at "
+        "this rate. Health/readiness probes, SSE streams, and the "
+        "``/v1/sessions/{id}/wait`` long-poll are exempt (a stream is one "
+        "long-lived request, not a request rate). The default leaves "
+        "headroom over the busiest counted traffic — console event polling "
+        "and connector runtime heartbeats/inbound — which stays well under "
+        "20 req/s per key in normal use. Set to 0 to disable limiting.",
+    )
 
     # ── web tools ──────────────────────────────────────────────────────────
     tavily_api_key: str | None = Field(

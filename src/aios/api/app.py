@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import Depends, FastAPI
 
 from aios.api.deps import require_bearer_auth
+from aios.api.rate_limit import RateLimitMiddleware
 from aios.api.routers import (
     accounts,
     agents,
@@ -89,6 +90,9 @@ def create_app() -> FastAPI:
         separate_input_output_schemas=False,
     )
     install_exception_handlers(app)
+    # Pure ASGI middleware: covers the /mcp mount too, and doesn't show up
+    # in the OpenAPI spec (no openapi.json / SDK regen needed).
+    app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.api_rate_limit_per_minute)
     app.include_router(health.router)
     app.include_router(accounts.router)
     app.include_router(environments.router)
