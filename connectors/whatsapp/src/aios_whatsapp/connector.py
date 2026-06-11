@@ -237,6 +237,10 @@ class WhatsappConnector(WhatsappManagementMixin, HttpConnector):
     ) -> dict[str, Any]:
         """Send a message to your focal WhatsApp chat.
 
+        The message is delivered to your focal channel. You must pass
+        channel_id equal to your focal channel's channel_id; to message a
+        different chat, call switch_channel first.
+
         Args:
             text: The message body.  When ``attachments`` is set, this
                 becomes the caption on the FIRST attachment only;

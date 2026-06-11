@@ -401,9 +401,9 @@ class TelegramConnector(HttpConnector):
     ) -> dict[str, Any]:
         """Send a Telegram message to your focal chat, optionally with attachments.
 
-        Both connection and chat ids are taken implicitly from your focal
-        channel — the SDK injects them from the call payload.  Set focal
-        with the built-in ``switch_channel`` tool.
+        The message is delivered to your focal channel. You must pass
+        channel_id equal to your focal channel's channel_id; to message a
+        different chat, call the built-in ``switch_channel`` tool first.
 
         Args:
             text: Message body.  Becomes the caption when attachments are

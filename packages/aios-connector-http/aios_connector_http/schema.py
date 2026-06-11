@@ -46,6 +46,22 @@ channel.  Stripping them from the model-facing schema means the
 runner is the sole source of truth and the model can't guess them
 wrong.
 
+Focal-targeting marker: tools whose signature accepts ``chat_id``
+have their destination injected from the session's focal channel,
+so the harness must verify the model's stated destination before
+dispatch.  ``derive_tool_spec`` records that discriminator as
+``input_schema["x-aios-focal-targeted"]`` (``True`` when the
+signature accepts ``chat_id``, ``False`` otherwise).  The aios
+harness strips the marker from the model-facing schema and, for
+focal-targeted tools, adds a required ``channel_id`` parameter that
+must equal the session's focal channel (see
+``aios.harness.channels.augment_focal_response_tools``); a missing
+marker is treated as focal-targeted so stale catalogs fail closed.
+Because the harness owns that parameter, ``channel_id`` is a reserved
+name on focal-targeted tools — a handler that both accepts ``chat_id``
+and declares a ``channel_id`` parameter raises ``SchemaError`` at
+derivation time.
+
 Docstrings parse Google-style: the description is everything before
 ``Args:``; the per-param descriptions come from the indented entries
 inside ``Args:``.  ``Returns:`` and other section headers terminate
@@ -105,6 +121,26 @@ def derive_tool_spec(name: str, fn: Callable[..., Any]) -> dict[str, Any]:
     input_schema: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         input_schema["required"] = required
+    # Focal-targeting discriminator (see module docstring): the dispatch
+    # runner injects the focal chat into exactly the tools whose
+    # signature accepts ``chat_id``, so only those calls have a
+    # focal-derived destination the harness must verify.
+    focal_targeted = "chat_id" in sig.parameters
+    if focal_targeted and "channel_id" in properties:
+        # The aios harness adds its own required ``channel_id``
+        # destination parameter to every focal-targeted tool's
+        # model-facing schema and strips it again before dispatch — a
+        # handler-declared ``channel_id`` would be silently clobbered
+        # on the way in and silently dropped on the way out.  Fail
+        # loud at derivation time (connector startup), not at the
+        # model.
+        raise SchemaError(
+            f"'channel_id': parameter name is reserved on focal-targeted tools "
+            f"(tool {name!r} accepts the SDK-injected 'chat_id'); the aios "
+            "harness owns 'channel_id' as the model-stated destination — "
+            "rename the parameter"
+        )
+    input_schema["x-aios-focal-targeted"] = focal_targeted
     return {
         "type": "custom",
         "name": name,

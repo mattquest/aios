@@ -20,6 +20,41 @@ from aios.models.events import Event
 
 MONOLOGUE_PREFIX = "INTERNAL_MONOLOGUE_NOT_SEEN_BY_USER: "
 
+# Model-facing destination parameter required on focal-targeted
+# connection tools.  Its value is a channel address (channel addresses
+# ARE channel_ids — the tail block labels each bound address
+# ``channel_id=<address>`` and ``switch_channel`` takes the same
+# value).  Extracted from the arguments before they reach the connector
+# runtime and emitted as the call's delivery destination — see
+# ``_extract_channel_id_argument`` in ``aios.db.queries``.
+CHANNEL_ID_PARAM = "channel_id"
+
+# Argument names the connector SDK injects at dispatch time (parsed
+# from the call payload's destination) — mirrors ``_INJECTED_PARAMS``
+# in ``aios_connector_http.schema``.  They never appear in model-facing
+# schemas, and a model-emitted focal-targeted call carrying one would
+# override the SDK's focal-derived injection and bypass the channel_id
+# validation entirely, so such calls are rejected at dispatch
+# validation (:func:`reject_off_focal_connection_calls`).  Non-model
+# callers (the SDK runner's direct-dispatch path, e2e direct calls)
+# are unaffected — the check runs only on assistant tool calls.
+RESERVED_CONNECTION_ARGUMENT_KEYS = frozenset({"chat_id", "connection_id", "external_account_id"})
+
+# Catalog-level discriminator stamped by the connector SDK
+# (``aios_connector_http.schema.derive_tool_spec``) inside each
+# published tool's ``input_schema``: ``True`` when the tool's handler
+# signature accepts the SDK-injected ``chat_id`` (its destination is
+# derived from the session's focal channel), ``False`` otherwise.
+# Missing means a catalog published before the marker existed — treated
+# as focal-targeted so stale catalogs fail closed.
+FOCAL_TARGETED_SCHEMA_KEY = "x-aios-focal-targeted"
+
+_CHANNEL_ID_DESCRIPTION = (
+    "The channel you are speaking on — must equal your focal channel's "
+    "channel_id (copy it from the channels tail block). To speak on a "
+    "different channel, call switch_channel(channel_id=...) first."
+)
+
 # Key under a switch_channel tool_result's ``data["metadata"]`` that
 # records the target and outcome — ``{"target": str | None, "success": bool}``.
 # :func:`derive_last_seen` / :func:`derive_unread_counts` anchor the
@@ -120,17 +155,30 @@ def build_focal_paradigm_block(channels: list[str]) -> str:
         "\n"
         "### Responding\n"
         "\n"
-        "When focused on a channel, the connector's response tools "
-        "(e.g. `signal_send`, `signal_react`) operate on your focal "
-        "channel implicitly — no channel/chat-id argument required. "
-        "Plain assistant text you emit while a channel is focal is "
-        "DELIVERED to that channel automatically — text is speech. "
-        "Use the send tools when you need platform features (reactions, "
-        "replies, attachments); plain text suffices for an ordinary "
-        "reply. With no focal channel ('phone down'), bare text reaches "
-        "no one. To think privately without speaking, prefix the text "
-        f"with {MONOLOGUE_PREFIX.strip()!r} — prefixed text is never "
-        "delivered.\n"
+        "Connector tools that speak on a chat (e.g. `signal_send`, "
+        "`signal_react`) REQUIRE a `channel_id` argument equal to your "
+        "focal channel's channel_id — copy it from the tail block "
+        "listing; each tool's schema shows whether it takes one. "
+        "Stating the destination on every call is what "
+        "guarantees a reply can never land on a channel you are not "
+        "focused on; a call whose channel_id is missing or differs "
+        "from your focal channel is rejected with an error instead of "
+        "being delivered. To speak on a different channel, call "
+        "`switch_channel(channel_id=<id>)` first, read the re-orient "
+        "context, then send. Plain assistant text you emit while a "
+        "channel is focal is DELIVERED to that channel automatically — "
+        "text is speech. The one exception: when every new message you "
+        "are reacting to arrived on some OTHER channel, bare text is "
+        "recorded as internal monologue instead — switch to that "
+        "channel first to reply there. New messages that carry no "
+        "channel (scheduled wakes, self-wakes, operator messages) and "
+        "steps with no new messages at all deliver normally. "
+        "Use the send tools when you need platform features "
+        "(reactions, replies, attachments); plain text suffices for an "
+        "ordinary reply. With no focal channel ('phone down'), bare "
+        "text reaches no one. To think privately without speaking, "
+        f"prefix the text with {MONOLOGUE_PREFIX.strip()!r} — prefixed "
+        "text is never delivered.\n"
         "\n"
         "### Staying silent\n"
         "\n"
@@ -475,12 +523,228 @@ def autodeliver_focal_text(
     send_tool = f"{focal_channel.split('/', 1)[0]}_send"
     if send_tool not in available_tool_names:
         return assistant_msg
+    # The synthesized send states its destination like a model-made call
+    # would: ``channel_id`` equals the focal channel, so the dispatch
+    # validation in ``reject_off_focal_connection_calls`` holds for
+    # auto-delivered text too (and the wire strip removes it before the
+    # connector runtime sees the arguments).
+    arguments = json.dumps({"text": text.strip(), CHANNEL_ID_PARAM: focal_channel})
     tool_call = {
         "id": f"call-autodeliver-{uuid.uuid4().hex[:24]}",
         "type": "function",
-        "function": {"name": send_tool, "arguments": json.dumps({"text": text.strip()})},
+        "function": {"name": send_tool, "arguments": arguments},
     }
     return {**assistant_msg, "content": "", "tool_calls": [tool_call]}
+
+
+def augment_focal_response_tools(
+    openai_tools: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], frozenset[str], frozenset[str]]:
+    """Add the required ``channel_id`` parameter to focal-targeted connection tools.
+
+    Takes the chat-completions tool dicts built from a session's
+    connection tool specs and returns ``(augmented_tools,
+    focal_tool_names, all_tool_names)``.  For every tool whose
+    ``input_schema`` carries :data:`FOCAL_TARGETED_SCHEMA_KEY` as
+    ``True`` — or doesn't carry it at all (stale catalog: fail closed) —
+    the parameters gain a required string ``channel_id`` property whose
+    description tells the model to state its destination.  Tools
+    explicitly marked ``False`` (e.g. ``whatsapp_list_groups``, which
+    targets no chat) pass through unaugmented.  The marker itself is
+    removed from the model-facing schema either way — it's a
+    catalog-level discriminator, not part of the tool's contract.
+
+    The focal name set is what the dispatch validation
+    (:func:`reject_off_focal_connection_calls`) checks ``channel_id``
+    against, so the schema requirement and the enforcement cover exactly
+    the same tools; the full name set scopes the reserved-argument
+    rejection, which applies to every connection tool regardless of
+    targeting.  Input dicts are not mutated.
+    """
+    out: list[dict[str, Any]] = []
+    focal_names: set[str] = set()
+    all_names: set[str] = set()
+    for tool in openai_tools:
+        fn = tool.get("function") or {}
+        params = fn.get("parameters") or {}
+        name = fn.get("name")
+        if isinstance(name, str) and name:
+            all_names.add(name)
+        focal_targeted = params.get(FOCAL_TARGETED_SCHEMA_KEY, True)
+        params = {k: v for k, v in params.items() if k != FOCAL_TARGETED_SCHEMA_KEY}
+        if focal_targeted:
+            properties = dict(params.get("properties") or {})
+            properties[CHANNEL_ID_PARAM] = {
+                "type": "string",
+                "description": _CHANNEL_ID_DESCRIPTION,
+            }
+            required = [r for r in (params.get("required") or []) if r != CHANNEL_ID_PARAM]
+            required.append(CHANNEL_ID_PARAM)
+            params = {
+                **params,
+                "type": params.get("type", "object"),
+                "properties": properties,
+                "required": required,
+            }
+            if isinstance(name, str) and name:
+                focal_names.add(name)
+        out.append({**tool, "function": {**fn, "parameters": params}})
+    return out, frozenset(focal_names), frozenset(all_names)
+
+
+def reject_off_focal_connection_calls(
+    assistant_msg: dict[str, Any],
+    focal_tool_names: frozenset[str],
+    connection_tool_names: frozenset[str],
+    focal_channel: str | None,
+) -> list[dict[str, Any]]:
+    """Build error tool-result payloads for connection calls that don't
+    state the focal channel as their destination.
+
+    The delivery-targeting invariant: a reply composed for channel X
+    must never be deliverable to channel Y.  Focal-targeted connection
+    tools (``focal_tool_names``, from
+    :func:`augment_focal_response_tools`) are dispatched to the
+    connector runtime with the call's stated ``channel_id`` as the
+    destination, so the model's call must carry
+    ``channel_id == focal_channel`` — missing, unparseable, or
+    mismatched calls are rejected here and never forwarded.
+
+    Calls carrying any of the SDK-injected argument names
+    (:data:`RESERVED_CONNECTION_ARGUMENT_KEYS`) are rejected too: those
+    keys never appear in model-facing schemas, and the SDK runner only
+    injects them when absent — a model-supplied ``chat_id`` would
+    silently override the validated destination.
+
+    Returns one ``role="tool"`` event payload per violating call, ready
+    for ``append_event``; the error text names the focal channel and the
+    corrective action (retry with the focal channel_id, or
+    ``switch_channel`` first).  Appending the error result resolves the
+    call, so the pending-calls queries the connector runtimes consume
+    never surface it.
+    """
+    from aios.tools.invoke import parse_arguments
+
+    rejections: list[dict[str, Any]] = []
+    for tc in assistant_msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        if name not in connection_tool_names:
+            continue
+        args = parse_arguments(fn.get("arguments"))
+        # Reserved SDK-injected keys are rejected on EVERY connection
+        # tool — a model-supplied connection_id on a non-focal tool
+        # would override the dispatch scoping just as a chat_id would
+        # override the destination on a focal-targeted one.
+        reserved = sorted(RESERVED_CONNECTION_ARGUMENT_KEYS & args.keys()) if args else []
+        if reserved:
+            error = _reserved_argument_error_text(name, reserved)
+            rejections.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or "unknown",
+                    "name": name,
+                    "content": json.dumps({"error": error}, ensure_ascii=False),
+                    "is_error": True,
+                }
+            )
+            continue
+        if name not in focal_tool_names:
+            continue
+        passed = args.get(CHANNEL_ID_PARAM) if args is not None else None
+        if isinstance(passed, str) and passed and passed == focal_channel:
+            continue
+        error = _off_focal_error_text(name, focal_channel, passed)
+        rejections.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc.get("id") or "unknown",
+                "name": name,
+                "content": json.dumps({"error": error}, ensure_ascii=False),
+                "is_error": True,
+            }
+        )
+    return rejections
+
+
+def _reserved_argument_error_text(name: str, reserved: list[str]) -> str:
+    """Compose the rejection error for SDK-reserved argument names."""
+    keys = ", ".join(reserved)
+    verb = "are not accepted arguments" if len(reserved) > 1 else "is not an accepted argument"
+    return (
+        f"{name} was not executed: {keys} {verb} — the destination comes "
+        "from your focal channel; state it via channel_id."
+    )
+
+
+def _off_focal_error_text(name: str, focal_channel: str | None, passed: Any) -> str:
+    """Compose the rejection error so the model knows exactly what to do."""
+    if isinstance(passed, str) and passed:
+        passed_clause = f"You passed channel_id={passed}."
+    else:
+        passed_clause = "You passed no channel_id."
+    if focal_channel is None:
+        return (
+            f"{name} was not executed: channel_id is required and must equal "
+            f"your focal channel's channel_id, but you have no focal channel. "
+            f"{passed_clause} Call switch_channel(channel_id=<id>) to focus a "
+            "bound channel, read the re-orient context, then send."
+        )
+    text = (
+        f"{name} was not executed: channel_id is required and must equal your "
+        f"focal channel's channel_id. Your focal channel is {focal_channel}. "
+        f"{passed_clause} To speak on {focal_channel}, retry with "
+        f"channel_id={focal_channel}."
+    )
+    if isinstance(passed, str) and passed:
+        text += (
+            f" To speak on {passed}, call switch_channel(channel_id={passed}) "
+            "first, read the re-orient context, then send."
+        )
+    return text
+
+
+def suppress_bare_text_delivery(events: Iterable[Event], focal_channel: str | None) -> bool:
+    """True when this step's new user stimulus arrived entirely on OTHER
+    channels.
+
+    "New" means user-role message events with ``seq`` greater than the
+    previous assistant message's watermark —
+    ``MAX(COALESCE(reacting_to, seq))`` over assistant messages, the
+    same derivation ``find_sessions_needing_inference`` uses.
+    Suppression requires ALL of: the new-stimulus set is non-empty,
+    every event in it carries a channel (``orig_channel``), and none of
+    those channels equals the focal channel.  Then bare assistant text
+    must not be auto-delivered: the model is reacting to content from a
+    channel it is not focused on, and delivering the reply to the focal
+    channel would hand it to the wrong audience.
+
+    Returns ``False`` — deliver normally — when there are no new user
+    events (scheduled/idle wakes keep delivering — proactive reminders
+    depend on this), when any new user event is on the focal channel,
+    or when any new user event carries no channel at all: self-wakes
+    (``wake_self``, the sandbox broker's messages route) and operator
+    console/API messages append user events without channel metadata,
+    and they address the session directly — a reminder firing on a
+    channel-bound session must still deliver.
+    """
+    watermark = 0
+    new_user_events: list[Event] = []
+    for e in events:
+        if e.kind != "message":
+            continue
+        role = e.data.get("role")
+        if role == "assistant":
+            reacting = e.data.get("reacting_to")
+            anchor = reacting if isinstance(reacting, int) else e.seq
+            if anchor > watermark:
+                watermark = anchor
+        elif role == "user":
+            new_user_events.append(e)
+    new_user_events = [e for e in new_user_events if e.seq > watermark]
+    if not new_user_events:
+        return False
+    return all(bool(e.orig_channel) and e.orig_channel != focal_channel for e in new_user_events)
 
 
 def drop_trivial_monologue(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

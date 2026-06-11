@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from aios.harness.channels import MONOLOGUE_PREFIX
 from tests.conftest import needs_docker
 from tests.e2e.conftest import live_aios_server
 from tests.e2e.harness import Harness, assistant, last_assistant_content, tool_call
@@ -332,12 +333,16 @@ class TestSignalMultiConnection:
         env = await env_svc.create_environment(
             harness._pool, name=f"env-sigo-{id(self)}", account_id=account_id
         )
+        # signal_send is focal-targeted: the dispatch validation requires
+        # channel_id == the session's focal channel on every call.
+        focal_a = f"signal/{PHONE_A}-out/{ALICE_UUID}"
         session_a = await sess_svc.create_session(
             harness._pool,
             agent_id=agent.id,
             environment_id=env.id,
             title=None,
             metadata={},
+            focal_channel=focal_a,
             account_id=account_id,
         )
         session_b = await sess_svc.create_session(
@@ -376,12 +381,19 @@ class TestSignalMultiConnection:
                     tool_calls=[
                         tool_call(
                             "signal_send",
-                            {"text": "hi-from-A", "chat_id": ALICE_UUID},
+                            # chat_id is SDK-injected from the delivery
+                            # destination (the call's channel_id); a
+                            # model-emitted chat_id is rejected at
+                            # dispatch validation.
+                            {"text": "hi-from-A", "channel_id": focal_a},
                             call_id="call_send",
                         )
                     ]
                 ),
-                assistant("done"),
+                # Monologue-prefixed: with a focal channel set, bare
+                # wrap-up text would be auto-delivered as a second
+                # signal_send; this test is about outbound demux routing.
+                assistant(f"{MONOLOGUE_PREFIX}done"),
             ]
         )
         await sess_svc.append_user_message(
@@ -432,7 +444,7 @@ class TestSignalMultiConnection:
             # Drive the wrap-up step so harness state stays clean.
             await harness.run_step(session_a.id)
             events = await harness.events(session_a.id)
-            assert last_assistant_content(events) == "done"
+            assert last_assistant_content(events) == f"{MONOLOGUE_PREFIX}done"
         finally:
             connector_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

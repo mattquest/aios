@@ -303,8 +303,9 @@ class SignalConnector(SignalManagementMixin, HttpConnector):
     ) -> dict[str, Any]:
         """Send a Signal message to your focal chat, optionally with attachments.
 
-        Both the connection and chat id are taken implicitly from your
-        focal channel — the SDK injects them from the call payload.
+        The message is delivered to your focal channel. You must pass
+        channel_id equal to your focal channel's channel_id; to message a
+        different chat, call switch_channel first.
 
         Args:
             text: Message body.  Markdown is converted to Signal text styles.
@@ -412,8 +413,9 @@ class SignalConnector(SignalManagementMixin, HttpConnector):
     ) -> dict[str, Any]:
         """Create a new Signal group on your account.
 
-        ``chat_id`` is passed through by the focal protocol but ignored
-        here — the new group has no chat_id yet.
+        channel_id is required by the focal protocol — pass your focal
+        channel's channel_id. The new group itself has no channel yet;
+        its id is returned so you can switch_channel into it later.
 
         Args:
             name: Group display name.

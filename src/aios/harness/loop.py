@@ -477,20 +477,28 @@ async def _run_session_step_body(
     )
 
     silence: dict[str, Any] | None = None
+    suppressed_delivery = False
     if channels:
         from aios.harness.channels import (
             apply_monologue_prefix,
             autodeliver_focal_text,
             strip_stay_silent,
+            suppress_bare_text_delivery,
         )
 
         # The channel delivery contract, in precedence order: an explicit
         # stay_silent call wins (stripped here — it must never dispatch or
         # linger in the log; the lifecycle event below is the audit trail);
         # otherwise bare substantive text is speech and is auto-delivered
-        # to the focal channel as a connector send; whatever text remains
-        # (monologue-prefixed thinking, text alongside tool calls) is
-        # tagged as internal monologue.
+        # to the focal channel as a connector send — unless every new
+        # user-stimulus event this step carries a channel and none of
+        # those channels is the focal one, in which case the text is a
+        # reply to a channel the session is not focused on and must not
+        # be handed to the focal audience (channel-less stimulus —
+        # self-wakes, console messages — delivers normally); whatever
+        # text remains (monologue-prefixed thinking, text alongside tool
+        # calls, suppressed off-focal replies) is tagged as internal
+        # monologue.
         assistant_msg, silence = strip_stay_silent(assistant_msg)
         if silence is None:
             _tool_names = {
@@ -501,10 +509,33 @@ async def _run_session_step_body(
                 and isinstance(t.get("function"), dict)
                 and "name" in t["function"]
             }
-            assistant_msg = autodeliver_focal_text(
-                assistant_msg, session.focal_channel, _tool_names
-            )
+            delivered = autodeliver_focal_text(assistant_msg, session.focal_channel, _tool_names)
+            if delivered is not assistant_msg and suppress_bare_text_delivery(
+                events, session.focal_channel
+            ):
+                suppressed_delivery = True
+            else:
+                assistant_msg = delivered
         assistant_msg = apply_monologue_prefix(assistant_msg)
+
+    # Delivery-targeting validation: focal-targeted connection tool calls
+    # must state ``channel_id == focal_channel`` and must not smuggle the
+    # SDK-injected argument names.  The stated channel_id is what the
+    # pending-calls queries emit as the call's delivery destination, so
+    # the validated value IS the delivered value even if a switch_channel
+    # in the same batch moves the live focal before the runtime polls.
+    # Violations get an immediate error tool-result; the calls never
+    # become pending external work.
+    from aios.harness.channels import reject_off_focal_connection_calls
+
+    rejections: list[dict[str, Any]] = []
+    if prelude.connection_tool_names:
+        rejections = reject_off_focal_connection_calls(
+            assistant_msg,
+            prelude.focal_connection_tool_names,
+            prelude.connection_tool_names,
+            session.focal_channel,
+        )
 
     # Record the seq of the latest user/tool event in the context this
     # response was based on; events after this seq are "new" on the next
@@ -512,10 +543,47 @@ async def _run_session_step_body(
     assistant_msg["reacting_to"] = step_ctx.reacting_to
 
     # Append assistant message to the session log (unfenced — procrastinate
-    # lock provides mutual exclusion).
-    await sessions_service.append_event(
-        pool, session_id, "message", assistant_msg, account_id=account_id
-    )
+    # lock provides mutual exclusion).  When the message carries rejected
+    # connection calls, their error tool-results commit in the SAME
+    # transaction: the assistant append's ``connector_calls_<type>``
+    # NOTIFY is delivered at commit, so the runtime's pending-calls query
+    # can never observe a rejected call without its resolving error —
+    # there is no window in which it could be forwarded.
+    if rejections:
+        from aios.db import queries
+
+        async with pool.acquire() as conn, conn.transaction():
+            await queries.append_event(
+                conn,
+                session_id=session_id,
+                kind="message",
+                data=assistant_msg,
+                account_id=account_id,
+            )
+            for rejection in rejections:
+                await queries.append_event(
+                    conn,
+                    session_id=session_id,
+                    kind="message",
+                    data=rejection,
+                    account_id=account_id,
+                )
+        log.warning(
+            "step.off_focal_calls_rejected",
+            session_id=session_id,
+            focal_channel=session.focal_channel,
+            tool_call_ids=[r["tool_call_id"] for r in rejections],
+            tool_names=[r["name"] for r in rejections],
+        )
+        # The rejection results are fresh stimulus; wake the session so
+        # the model reads the error and corrects course without waiting
+        # for the periodic sweep.  The wake's entry guard still applies
+        # (a batch with other pending external calls keeps waiting).
+        await defer_wake(pool, session_id, cause="off_focal_rejection", account_id=account_id)
+    else:
+        await sessions_service.append_event(
+            pool, session_id, "message", assistant_msg, account_id=account_id
+        )
 
     if silence is not None:
         # Lifecycle, not a tool_result: results are inference stimulus and
@@ -530,12 +598,45 @@ async def _run_session_step_body(
         )
         log.info("step.stayed_silent", session_id=session_id, reason=reason)
 
+    if suppressed_delivery:
+        # Audit trail, mirroring ``stayed_silent``: lifecycle events are
+        # not inference stimulus, so this cannot re-fire the step.  The
+        # model-visible signal is the monologue prefix stamped on its
+        # undelivered text plus the paradigm prose explaining the rule.
+        await sessions_service.append_event(
+            pool,
+            session_id,
+            "lifecycle",
+            {
+                "event": "autodelivery_suppressed",
+                "reason": "new user stimulus was off-focal only",
+                "focal_channel": session.focal_channel,
+            },
+            account_id=account_id,
+        )
+        log.warning(
+            "step.autodelivery_suppressed",
+            session_id=session_id,
+            focal_channel=session.focal_channel,
+        )
+        # No wake is deferred here: the assistant message's reacting_to
+        # watermark already covers the off-focal stimulus and lifecycle
+        # events are not inference stimulus, so a wake would early-out
+        # unconditionally.  Suppression is an enforced stay-silent — the
+        # model sees its monologue-prefixed text on the next real
+        # stimulus and can switch_channel + send then.
+
     # Partition tool calls into dispatch buckets. Immediate builtin/MCP
     # launch now; ``needs_confirm`` and ``custom`` sit unresolved in the
     # log until an external POST lands the result — the session ends its
     # turn anyway and any stimulus can wake it (``Session.awaiting``
-    # surfaces what's still pending).
-    tool_calls: list[dict[str, Any]] = assistant_msg.get("tool_calls") or []
+    # surfaces what's still pending).  Rejected off-focal connection
+    # calls are already resolved by their error results — nothing to
+    # dispatch or hold pending for them.
+    rejected_ids = {r["tool_call_id"] for r in rejections}
+    tool_calls: list[dict[str, Any]] = [
+        tc for tc in (assistant_msg.get("tool_calls") or []) if tc.get("id") not in rejected_ids
+    ]
 
     if tool_calls:
         immediate: list[dict[str, Any]] = []
@@ -1099,8 +1200,13 @@ async def _narrate_terminal_failure(
                     "id": f"call-failnarrate-{_uuid.uuid4().hex[:24]}",
                     "type": "function",
                     "function": {
+                        # ``channel_id`` states the destination like every
+                        # other connection send (stripped at the wire); the
+                        # narration targets the focal channel by design.
                         "name": send_tool,
-                        "arguments": _json.dumps({"text": _failure_text(error_type)}),
+                        "arguments": _json.dumps(
+                            {"text": _failure_text(error_type), "channel_id": focal}
+                        ),
                     },
                 }
             ],

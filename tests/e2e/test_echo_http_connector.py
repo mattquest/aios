@@ -51,11 +51,16 @@ async def _publish_echo_tools_schema(harness: Harness) -> None:
             db_conn,
             "echo",
             tools_schema=[
+                # Focal-targeting markers mirror what ``derive_tool_spec``
+                # publishes for the real EchoConnector: ping/echo take no
+                # chat_id (not focal-targeted, no channel_id required);
+                # trigger_inbound does (the harness requires channel_id ==
+                # focal on its calls).
                 {
                     "type": "custom",
                     "name": "ping",
                     "description": "ping",
-                    "input_schema": {"type": "object"},
+                    "input_schema": {"type": "object", "x-aios-focal-targeted": False},
                 },
                 {
                     "type": "custom",
@@ -65,20 +70,24 @@ async def _publish_echo_tools_schema(harness: Harness) -> None:
                         "type": "object",
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
+                        "x-aios-focal-targeted": False,
                     },
                 },
                 {
                     "type": "custom",
                     "name": "trigger_inbound",
                     "description": "synth inbound",
+                    # chat_id is SDK-injected (parsed from the delivery
+                    # destination), so — like derive_tool_spec — it does
+                    # not appear in the model-facing schema.
                     "input_schema": {
                         "type": "object",
                         "properties": {
-                            "chat_id": {"type": "string"},
                             "sender_name": {"type": "string"},
                             "content": {"type": "string"},
                         },
-                        "required": ["chat_id", "sender_name", "content"],
+                        "required": ["sender_name", "content"],
+                        "x-aios-focal-targeted": True,
                     },
                 },
             ],
@@ -313,12 +322,17 @@ class TestEchoHttpConnectorEndToEnd:
         env = await env_svc.create_environment(
             harness._pool, name=f"env-e2e-i-{id(self)}", account_id=account_id
         )
+        # trigger_inbound is focal-targeted (its signature accepts the
+        # SDK-injected chat_id), so the dispatch validation requires its
+        # calls to state channel_id == the session's focal channel.
+        focal = f"echo/acct-i-{id(self)}/chat-1"
         session = await sess_svc.create_session(
             harness._pool,
             agent_id=agent.id,
             environment_id=env.id,
             title=None,
             metadata={},
+            focal_channel=focal,
             account_id=account_id,
         )
 
@@ -338,8 +352,11 @@ class TestEchoHttpConnectorEndToEnd:
                     tool_calls=[
                         tool_call(
                             "trigger_inbound",
+                            # chat_id is SDK-injected from the delivery
+                            # destination (the call's channel_id) — the
+                            # chat-1 tail of ``focal``.
                             {
-                                "chat_id": "chat-1",
+                                "channel_id": focal,
                                 "sender_name": "Alice",
                                 "content": "synthesized hi",
                             },

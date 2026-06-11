@@ -110,11 +110,15 @@ def _jid_identity_key(jid: str) -> str:
 
 
 WHATSAPP_SERVER_INSTRUCTIONS = """\
-## chat_id
+## channel_id
 
 Each WhatsApp channel address is path-shaped:
-``whatsapp/<phone>/<chat_id>``.  The ``chat_id`` segment is what
-you pass to the tools below — pass it verbatim, do not decode it.
+``whatsapp/<phone>/<chat_id>``.  The full address is the channel's
+``channel_id`` — the value the chat-targeting tools below require,
+equal to your focal channel's channel_id (copy it from the channels
+tail block or from ``switch_channel``).  No tool takes a bare
+``chat_id`` segment; the destination chat is derived from your focal
+channel.  The ``<chat_id>`` segment shapes you will see in addresses:
 DMs use ``<digits>@s.whatsapp.net`` (or ``<digits>@lid`` for
 linked-device-identity peers); groups use ``<id>@g.us``.
 
@@ -136,13 +140,18 @@ WhatsApp message ids are hex strings like ``3EB0E03B46303C22D750E2``
 
 ## Sending messages — `whatsapp_send`
 
-**Your text responses are NOT sent automatically.**  Bare assistant
-text is internal monologue; nobody on WhatsApp sees it.  To deliver
-a message you MUST call:
+Deliver a message to your focal chat:
 
-    whatsapp_send(text="your message here")
+    whatsapp_send(channel_id="<your focal channel_id>", text="your message here")
 
-If you don't call this tool, no one will see your response.
+``channel_id`` must equal your focal channel's channel_id (copy it
+from the channels tail block) — it states the destination so a reply
+can never land on a chat you are not focused on.  To message a
+different chat, call the built-in ``switch_channel`` tool first.
+Plain assistant text on a focal channel is also delivered
+automatically when the messages you are reacting to are on that
+channel; use ``whatsapp_send`` when you need attachments or
+quote-replies.
 
 ### Markdown subset
 
@@ -235,12 +244,14 @@ bot is added implicitly as the creator):
         participants=["+15551234567", "+18007654321"],
     )
 
-The result includes the new group's JID, which you can hand to
-``whatsapp_send``'s ``chat_id`` to focus into it.
+The result includes the new group's JID; the group's channel address
+is ``whatsapp/<phone>/<jid>`` — hand that to ``switch_channel`` to
+focus into it.
 
-Rename a group the bot is an admin in:
+Rename your focal group (the bot must be an admin in it).  If the
+group is not your focal channel, ``switch_channel`` into it first:
 
-    whatsapp_rename_group(chat_id="<group_jid>", name="New name")
+    whatsapp_rename_group(channel_id="<your focal channel_id>", name="New name")
 
 ## What you can and can't see in attachments
 

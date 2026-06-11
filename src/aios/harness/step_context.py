@@ -120,12 +120,23 @@ class StepPrelude:
     unread counts).  Reserving this ahead of time keeps the send-time
     payload under ``window_max`` even when the tail renders at its
     fattest (every channel at 9999 unread with a maxed-out preview).
+
+    ``focal_connection_tool_names`` are the connection custom tools whose
+    model-facing schema gained the required ``channel_id`` parameter (see
+    :func:`aios.harness.channels.augment_focal_response_tools`); the step
+    body validates calls to exactly these names against the session's
+    focal channel before they can reach a connector runtime.
+    ``connection_tool_names`` is the full connection custom tool set —
+    the reserved-argument rejection (SDK-injected keys like ``chat_id``)
+    applies to all of them, focal-targeted or not.
     """
 
     system_prompt: str
     tools: list[dict[str, Any]]
     skill_versions: list[SkillVersion]
     tail_block_upper_bound_local: int
+    focal_connection_tool_names: frozenset[str] = frozenset()
+    connection_tool_names: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -157,6 +168,7 @@ async def compute_step_prelude(
     byte-identical to what it was before the split.
     """
     from aios.harness.channels import (
+        augment_focal_response_tools,
         augment_with_focal_paradigm,
         max_tail_block_local,
     )
@@ -201,9 +213,18 @@ async def compute_step_prelude(
     connection_tool_dicts = await harness_runtime.require_tool_provider().list_tools_for_session(
         pool, session_id
     )
+    focal_connection_tool_names: frozenset[str] = frozenset()
+    connection_tool_names: frozenset[str] = frozenset()
     if connection_tool_dicts:
         connection_tools = [ToolSpec.model_validate(d) for d in connection_tool_dicts]
-        tools.extend(to_openai_tools(connection_tools))
+        # Delivery-targeting invariant: focal-targeted connection tools
+        # gain a required ``channel_id`` parameter so every call states
+        # its destination; the step body verifies it equals the focal
+        # channel before the call can reach the connector runtime.
+        connection_openai, focal_connection_tool_names, connection_tool_names = (
+            augment_focal_response_tools(to_openai_tools(connection_tools))
+        )
+        tools.extend(connection_openai)
 
     skill_versions = (
         await skills_service.resolve_skill_refs(pool, agent.skills, account_id=account_id)
@@ -220,6 +241,8 @@ async def compute_step_prelude(
         tools=tools,
         skill_versions=skill_versions,
         tail_block_upper_bound_local=max_tail_block_local(channels) + TIME_BLOCK_MAX_LOCAL,
+        focal_connection_tool_names=focal_connection_tool_names,
+        connection_tool_names=connection_tool_names,
     )
 
 

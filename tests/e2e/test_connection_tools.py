@@ -120,9 +120,15 @@ class TestConnectionToolsInPrelude:
         assert "chat_send" in names, (
             f"connection tool absent from prelude — model will never see schema. tools={names}"
         )
-        # Schema flows through unchanged.
+        # Declared schema flows through; the harness additionally requires
+        # channel_id on focal-targeted connection tools (no marker on this
+        # catalog entry → treated focal-targeted, fail closed).
         chat_send = next(t for t in prelude.tools if t["function"]["name"] == "chat_send")
-        assert chat_send["function"]["parameters"]["properties"]["text"]["type"] == "string"
+        params = chat_send["function"]["parameters"]
+        assert params["properties"]["text"]["type"] == "string"
+        assert params["properties"]["channel_id"]["type"] == "string"
+        assert "channel_id" in params["required"]
+        assert prelude.focal_connection_tool_names == frozenset({"chat_send"})
 
     async def test_per_chat_origin_connection_tools_visible(
         self, harness: Harness, crypto_box: CryptoBox
@@ -278,6 +284,10 @@ class TestConnectionToolDispatch:
                 db_conn,
                 "echo",
                 tools_schema=[
+                    # Marked not-focal-targeted: this test exercises the
+                    # awaiting → tool-result → resume plumbing, not the
+                    # channel_id destination validation (covered by the
+                    # harness unit tests in test_channel_targeting.py).
                     {
                         "type": "custom",
                         "name": "chat_send",
@@ -286,6 +296,7 @@ class TestConnectionToolDispatch:
                             "type": "object",
                             "properties": {"text": {"type": "string"}},
                             "required": ["text"],
+                            "x-aios-focal-targeted": False,
                         },
                     },
                 ],

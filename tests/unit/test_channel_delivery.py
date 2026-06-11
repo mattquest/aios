@@ -99,7 +99,13 @@ class TestAutodeliverFocalText:
         assert out["content"] == ""
         (tc,) = out["tool_calls"]
         assert tc["function"]["name"] == "signal_send"
-        assert json.loads(tc["function"]["arguments"]) == {"text": "Dinner is at 7."}
+        # The synthesized send states its destination: channel_id equals
+        # the focal channel, so dispatch validation holds for
+        # auto-delivered text too.
+        assert json.loads(tc["function"]["arguments"]) == {
+            "text": "Dinner is at 7.",
+            "channel_id": FOCAL,
+        }
         assert tc["id"].startswith("call-autodeliver-")
 
     def test_no_focal_channel_is_noop(self) -> None:
@@ -134,12 +140,12 @@ class TestAutodeliverFocalText:
         content = [{"type": "text", "text": "Reply here."}]
         out = autodeliver_focal_text(_msg(content), FOCAL, SEND_TOOLS)
         args = json.loads(out["tool_calls"][0]["function"]["arguments"])
-        assert args == {"text": "Reply here."}
+        assert args == {"text": "Reply here.", "channel_id": FOCAL}
 
     def test_text_is_stripped_of_surrounding_whitespace(self) -> None:
         out = autodeliver_focal_text(_msg("  hi there \n"), FOCAL, SEND_TOOLS)
         args = json.loads(out["tool_calls"][0]["function"]["arguments"])
-        assert args == {"text": "hi there"}
+        assert args == {"text": "hi there", "channel_id": FOCAL}
 
 
 # ── drop_trivial_monologue ──────────────────────────────────────────────────

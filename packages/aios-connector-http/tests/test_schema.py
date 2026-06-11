@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+import pytest
 from aios_connector_http import HttpConnector, SandboxPath, tool
-from aios_connector_http.schema import derive_tool_spec
+from aios_connector_http.schema import SchemaError, derive_tool_spec
 
 
 class _DummyForBindings(HttpConnector):
@@ -278,6 +279,68 @@ class TestDocstringParsing:
         # No docstring → empty description, no per-param descriptions.
         assert spec["description"] == ""
         assert "description" not in spec["input_schema"]["properties"]["x"]
+
+
+class TestFocalTargetedMarker:
+    """The ``x-aios-focal-targeted`` discriminator records whether the
+    dispatcher injects the focal chat into this tool (signature accepts
+    ``chat_id``).  The aios harness uses it to decide which connection
+    tools require the model-facing ``channel_id`` destination parameter.
+    """
+
+    def test_chat_id_accepting_tool_is_marked_focal_targeted(self) -> None:
+        class C(_DummyForBindings):
+            @tool()
+            async def t(self, *, text: str, chat_id: str) -> str:
+                return f"{chat_id}: {text}"
+
+        spec = derive_tool_spec("t", C().t)
+        assert spec["input_schema"]["x-aios-focal-targeted"] is True
+
+    def test_tool_without_chat_id_is_marked_not_focal_targeted(self) -> None:
+        class C(_DummyForBindings):
+            @tool()
+            async def t(self, *, text: str, connection_id: str) -> str:
+                return f"{connection_id}: {text}"
+
+        spec = derive_tool_spec("t", C().t)
+        assert spec["input_schema"]["x-aios-focal-targeted"] is False
+
+    def test_marker_is_not_a_property(self) -> None:
+        # The marker lives beside ``properties``, never inside it — the
+        # harness strips it before the schema reaches the model.
+        class C(_DummyForBindings):
+            @tool()
+            async def t(self, *, chat_id: str) -> str:
+                return chat_id
+
+        spec = derive_tool_spec("t", C().t)
+        assert "x-aios-focal-targeted" not in spec["input_schema"]["properties"]
+
+    def test_channel_id_param_on_focal_targeted_tool_fails_derivation(self) -> None:
+        # The harness adds (and strips) its own required ``channel_id``
+        # destination parameter on focal-targeted tools — a handler
+        # declaring one would be silently clobbered.  Connector authors
+        # must fail loud at startup, not at the model.
+        class C(_DummyForBindings):
+            @tool()
+            async def t(self, *, channel_id: str, chat_id: str) -> str:
+                return f"{chat_id}: {channel_id}"
+
+        with pytest.raises(SchemaError, match=r"channel_id.*reserved"):
+            derive_tool_spec("t", C().t)
+
+    def test_channel_id_param_on_non_focal_tool_is_allowed(self) -> None:
+        # A tool that takes no ``chat_id`` is never augmented by the
+        # harness; its own ``channel_id`` parameter is legitimate.
+        class C(_DummyForBindings):
+            @tool()
+            async def t(self, *, channel_id: str) -> str:
+                return channel_id
+
+        spec = derive_tool_spec("t", C().t)
+        assert spec["input_schema"]["x-aios-focal-targeted"] is False
+        assert spec["input_schema"]["properties"]["channel_id"]["type"] == "string"
 
 
 class TestSpecShape:

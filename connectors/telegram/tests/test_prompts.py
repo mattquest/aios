@@ -33,7 +33,7 @@ class TestBuildInstructions:
     def test_identity_block_comes_first(self) -> None:
         result = build_instructions(bot_id=1, username="u", first_name="n")
         identity_idx = result.find("## Your identity")
-        body_idx = result.find("## chat_id")
+        body_idx = result.find("## channel_id")
         assert identity_idx >= 0
         assert body_idx > identity_idx
 

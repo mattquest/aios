@@ -53,29 +53,33 @@ def build_instructions(
 
 
 TELEGRAM_SERVER_INSTRUCTIONS = """\
-## chat_id
+## channel_id
 
-Each Telegram channel address is path-shaped: ``telegram/<external_account_id>/<chat_id>``
-(``<external_account_id>`` is the bot_id above).
-The ``chat_id`` segment is a signed integer:
-
-- Positive for direct messages (the counterparty's user id).
-- Negative for groups (``-123456789``) and supergroups (``-1001234567890``).
-
-Pass it verbatim from the channel path — do not decode or modify it.
+Each Telegram channel address is path-shaped:
+``telegram/<external_account_id>/<chat_id>``
+(``<external_account_id>`` is the bot_id above).  The full address is
+the channel's ``channel_id`` — the value every telegram_* tool
+requires, equal to your focal channel's channel_id (copy it from the
+channels tail block or from ``switch_channel``).  No tool takes a bare
+``chat_id`` segment; the destination chat is derived from your focal
+channel.  The ``<chat_id>`` segment is a signed integer: positive for
+direct messages (the counterparty's user id), negative for groups
+(``-123456789``) and supergroups (``-1001234567890``).
 
 ## Sending messages — `telegram_send`
 
-**Your text responses are NOT sent automatically.** Bare assistant text
-is internal monologue; nobody on Telegram sees it. To deliver a message
-you MUST call:
+Deliver a message to your focal chat:
 
-    telegram_send(text="your message here")
+    telegram_send(channel_id="<your focal channel_id>", text="your message here")
 
-The chat_id is taken implicitly from your focal channel — aios injects
-it on each call. Set focal with the built-in ``switch_channel`` tool.
-
-If you don't call this tool, no one will see your response.
+``channel_id`` must equal your focal channel's channel_id (copy it
+from the channels tail block) — it states the destination so a reply
+can never land on a chat you are not focused on. To message a
+different chat, call the built-in ``switch_channel`` tool first. Every
+telegram_* tool requires the same ``channel_id`` argument. Plain
+assistant text on a focal channel is also delivered automatically when
+the messages you are reacting to are on that channel; use
+``telegram_send`` when you need formatting, replies, or attachments.
 
 ### Formatting — opt in with `parse_mode="html"`
 
@@ -90,9 +94,11 @@ Telegram's HTML parse mode for you.
 
 Examples:
 
-    telegram_send(text="**done** — see [results](https://example.com)",
+    telegram_send(channel_id="<your focal channel_id>",
+                  text="**done** — see [results](https://example.com)",
                   parse_mode="html")
-    telegram_send(text="```python\\nprint(\\"hi\\")\\n```", parse_mode="html")
+    telegram_send(channel_id="<your focal channel_id>",
+                  text="```python\\nprint(\\"hi\\")\\n```", parse_mode="html")
 
 If your text is plain prose with no markup, leave ``parse_mode`` at its
 default.
@@ -119,7 +125,8 @@ better anyway. If you truly need more, split the content across multiple
 ## Showing you're working — `telegram_typing`
 
 Before slow work (a long tool run, a heavy LLM hop) you can call
-``telegram_typing()`` to show a "typing…" bubble in the chat.  Telegram
+``telegram_typing(channel_id="<your focal channel_id>")`` to show a
+"typing…" bubble in the chat.  Telegram
 displays it for up to 5 seconds or until your next message arrives — no
 need to call it on a timer for fast replies.  Use ``action="upload_photo"``
 or ``"upload_document"`` etc. before sending media if the upload is

@@ -82,13 +82,16 @@ def _render_group_roster(
 
 
 SIGNAL_SERVER_INSTRUCTIONS = """\
-## chat_id
+## chat_id and channel_id
 
 Each Signal channel address is path-shaped: ``signal/<account>/<chat_id>``.
-The ``chat_id`` segment is what you pass to the tools below — pass it
-verbatim, do not decode it.  It already encodes the distinction between
-direct messages (a recipient UUID) and groups (a URL-safe-base64 group
-id) so the tool can route correctly.
+The full address is the channel's ``channel_id``.  Every signal_* tool
+requires a ``channel_id`` argument equal to your focal channel's
+channel_id — copy it from the channels tail block.  The destination of
+each call is your focal channel; to act on a different chat, call
+``switch_channel(channel_id=...)`` first, read the re-orient context,
+then call the tool.  A call whose channel_id does not match your focal
+channel is rejected with an error instead of being delivered.
 
 ## Reading inbound messages
 
@@ -130,13 +133,16 @@ header's ``timestamp_ms`` and ``sender_uuid``).
 
 ## Sending messages — `signal_send`
 
-**Your text responses are NOT sent automatically.** Bare assistant text
-is internal monologue; nobody on Signal sees it.  To deliver a message
-you MUST call:
+Deliver a message to your focal chat:
 
-    signal_send(text="your message here")
+    signal_send(channel_id="<your focal channel_id>", text="your message here")
 
-If you don't call this tool, no one will see your response.
+``channel_id`` must equal your focal channel's channel_id — it states
+the destination so a reply can never land on a chat you are not
+focused on.  Plain assistant text on a focal channel is also delivered
+automatically when the messages you are reacting to are on that
+channel; use ``signal_send`` when you need quoting, editing, or
+attachments.
 
 ### Avoid splitting one thought into multiple messages
 
@@ -193,7 +199,8 @@ timestamp from `sent_at_ms` in a prior `signal_send` result.
 Delete-for-everyone a message you sent earlier.  Pass the
 `sent_at_ms` you got back from `signal_send`:
 
-    signal_delete(target_timestamp_ms=<sent_at_ms>)
+    signal_delete(channel_id="<your focal channel_id>",
+                  target_timestamp_ms=<sent_at_ms>)
 
 Only your own messages can be deleted.  Use sparingly — deletes are
 visible (a tombstone replaces the message).
@@ -205,6 +212,7 @@ Use the ``sender_uuid`` and ``timestamp_ms`` from the inbound header
 of the message you're reacting to:
 
     signal_react(
+        channel_id="<your focal channel_id>",
         target_author_uuid="<sender_uuid from header>",
         target_timestamp_ms=<timestamp_ms from header>,
         emoji="👍",
@@ -219,6 +227,7 @@ For example, if you see:
 react with:
 
     signal_react(
+        channel_id="<your focal channel_id>",
         target_author_uuid="fb2c91e2-aaaa-...",
         target_timestamp_ms=1700000000000,
         emoji="🎉",
@@ -241,7 +250,8 @@ about what a human would naturally react to.
 
 Create a new group on the focal account:
 
-    signal_create_group(name="Project X", member_uuids=["<uuid1>", "<uuid2>"])
+    signal_create_group(channel_id="<your focal channel_id>",
+                        name="Project X", member_uuids=["<uuid1>", "<uuid2>"])
 
 You're added as the creator implicitly; pass the other members'
 UUIDs.  The result includes the new group's id, which you can hand
@@ -249,7 +259,7 @@ to `switch_channel` to focus into it.
 
 Rename your focal group (only valid when focal is a group, not a DM):
 
-    signal_rename_group(name="New name")
+    signal_rename_group(channel_id="<your focal channel_id>", name="New name")
 
 ## Markdown subset
 

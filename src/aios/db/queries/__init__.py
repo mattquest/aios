@@ -2458,6 +2458,72 @@ async def import_events(
     return len(events)
 
 
+def _focal_targeted_tool_names(tools_data: Any) -> set[str]:
+    """Names of catalog tools whose calls are delivered to a stated channel.
+
+    Reads the ``x-aios-focal-targeted`` marker the connector SDK stamps
+    on each published tool's ``input_schema`` (literal key here to keep
+    the db layer free of harness imports — the constant is
+    ``aios.harness.channels.FOCAL_TARGETED_SCHEMA_KEY``).  A missing
+    marker means a catalog published before the marker existed and is
+    treated as focal-targeted, matching
+    ``aios.harness.channels.augment_focal_response_tools`` (fail
+    closed).  Tools explicitly marked ``False`` keep their arguments
+    untouched — they may legitimately declare their own ``channel_id``
+    parameter.
+    """
+    out: set[str] = set()
+    for t in tools_data:
+        if not isinstance(t, dict) or "name" not in t:
+            continue
+        schema = t.get("input_schema")
+        marker = schema.get("x-aios-focal-targeted", True) if isinstance(schema, dict) else True
+        if marker:
+            out.add(t["name"])
+    return out
+
+
+def _extract_channel_id_argument(arguments: Any) -> tuple[Any, str | None]:
+    """Split a focal-targeted pending call's arguments into
+    ``(wire_arguments, stated_channel_id)``.
+
+    ``channel_id`` is the model-facing destination statement required on
+    focal-targeted connection tools (see
+    :func:`aios.harness.channels.augment_focal_response_tools`).  The
+    step body validates it against the focal channel at validation time,
+    but the live ``sessions.focal_channel`` can move between that
+    validation and this poll (a ``switch_channel`` completing in the
+    same assistant batch) — so the call's own validated ``channel_id``
+    is the authoritative destination.  Callers emit it as the payload's
+    ``focal_channel`` field (channel addresses ARE channel_ids); the
+    live focal is only a fallback for calls that carry no channel_id.
+
+    Removing the key from the wire arguments is mandatory, not
+    cosmetic: the connector SDK dispatches arguments as ``**kwargs``
+    into the ``@tool`` method, and no focal-targeted handler signature
+    accepts ``channel_id`` — an unexpected key raises ``TypeError`` at
+    the connector.
+
+    Malformed or non-dict arguments pass through unchanged with no
+    stated destination; the connector's own argument parsing handles
+    those exactly as before.  A non-string or empty ``channel_id`` is
+    stripped but yields no destination (fall back to live focal).
+    """
+    if not isinstance(arguments, str):
+        return arguments, None
+    try:
+        parsed = json.loads(arguments)
+    except ValueError:
+        return arguments, None
+    if not isinstance(parsed, dict) or "channel_id" not in parsed:
+        return arguments, None
+    stated = parsed.pop("channel_id")
+    stripped = json.dumps(parsed, ensure_ascii=False)
+    if isinstance(stated, str) and stated:
+        return stripped, stated
+    return stripped, None
+
+
 async def list_pending_calls_for_connector(
     conn: asyncpg.Connection[Any],
     connector: str,
@@ -2478,6 +2544,12 @@ async def list_pending_calls_for_connector(
     ``workspace_path`` is the session's host-side bind-mount source for
     ``/workspace`` (the ``workspace_volume_path`` column); the connector
     SDK uses it to resolve ``SandboxPath`` arguments to host paths.
+
+    ``focal_channel`` is the call's delivery destination: for
+    focal-targeted tools whose arguments carry the validated
+    ``channel_id``, that value (extracted and stripped from the wire
+    arguments via :func:`_extract_channel_id_argument`); otherwise the
+    session's live ``focal_channel`` (non-focal tools, stale catalogs).
 
     Output dict shape::
 
@@ -2503,6 +2575,7 @@ async def list_pending_calls_for_connector(
     name_set = {t["name"] for t in tools_data if isinstance(t, dict) and "name" in t}
     if not name_set:
         return []
+    focal_targeted = _focal_targeted_tool_names(tools_data)
 
     # Find bound sessions of this connector type. Tenant isolation: both
     # ``connections.account_id`` and ``sessions.account_id`` must match the
@@ -2554,14 +2627,23 @@ async def list_pending_calls_for_connector(
                 name = fn.get("name")
                 if name not in name_set:
                     continue
+                arguments = fn.get("arguments", "{}")
+                destination = focal
+                if name in focal_targeted:
+                    # The call's validated channel_id is the authoritative
+                    # destination — the live focal may have moved since
+                    # validation (switch_channel in the same batch).
+                    arguments, stated = _extract_channel_id_argument(arguments)
+                    if stated is not None:
+                        destination = stated
                 out.append(
                     {
                         "session_id": sid,
                         "tool_call_id": tc["id"],
                         "name": name,
-                        "arguments": fn.get("arguments", "{}"),
+                        "arguments": arguments,
                         "connection_id": conn_id,
-                        "focal_channel": focal,
+                        "focal_channel": destination,
                         "workspace_path": workspace_path,
                     }
                 )
@@ -2605,6 +2687,7 @@ async def list_pending_calls_for_session_and_connection(
     name_set = {t["name"] for t in tools_data if isinstance(t, dict) and "name" in t}
     if not name_set:
         return []
+    focal_targeted = _focal_targeted_tool_names(tools_data)
 
     raw_by_sid = await _latest_unresolved_tool_calls(conn, [session_id], account_id=account_id)
     focal = conn_row["focal_channel"]
@@ -2615,14 +2698,23 @@ async def list_pending_calls_for_session_and_connection(
         name = fn.get("name")
         if name not in name_set:
             continue
+        arguments = fn.get("arguments", "{}")
+        destination = focal
+        if name in focal_targeted:
+            # The call's validated channel_id is the authoritative
+            # destination — the live focal may have moved since
+            # validation (switch_channel in the same batch).
+            arguments, stated = _extract_channel_id_argument(arguments)
+            if stated is not None:
+                destination = stated
         out.append(
             {
                 "session_id": session_id,
                 "tool_call_id": tc["id"],
                 "name": name,
-                "arguments": fn.get("arguments", "{}"),
+                "arguments": arguments,
                 "connection_id": connection_id,
-                "focal_channel": focal,
+                "focal_channel": destination,
                 "workspace_path": workspace_path,
             }
         )
