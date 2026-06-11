@@ -175,6 +175,10 @@ class MemoryVersion(BaseModel):
     type: Literal["memory_version"] = "memory_version"
     memory_store_id: str
     memory_id: str
+    # Per-store monotonic write counter (allocated under the store row lock).
+    # Unambiguous newest-first ordering and the keyset for cursor pagination
+    # of ``GET /v1/memory-stores/{id}/memory-versions``.
+    seq: int
     operation: MemoryOperation
     path: str | None = None
     content: str | None = None

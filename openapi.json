@@ -3114,6 +3114,75 @@
         }
       }
     },
+    "/v1/sessions/{session_id}/events:import": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Import Events",
+        "description": "Bulk-insert historical events into a session (data import).\n\nThe write surface behind ``aios import``: events exported from another\ndeployment are re-inserted with their original ids, seqs, and\ntimestamps. The batch must continue exactly at the session's current\n``last_event_seq + 1`` and be strictly consecutive \u2014 the gapless-seq\ninvariant is validated, never bypassed. Large histories are imported\nas multiple consecutive batches.\n\nUnlike ``POST /messages`` this appends no wake job and emits no SSE\nnotify: importing a log must not start inference. The channel stamps\n(``orig_channel``/``channel``) are not part of the public event shape\nand are stamped NULL; everything else (search columns, cumulative\ntoken counts) is re-derived from ``data`` exactly as the live append\npath would.",
+        "operationId": "import_session_events",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          },
+          {
+            "name": "Authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventsImportRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsImportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sessions/{session_id}/events/{event_id}": {
       "get": {
         "tags": [
@@ -5301,7 +5370,7 @@
           "memory-stores"
         ],
         "summary": "List Memories",
-        "description": "List memories in a store, optionally filtered and grouped by path.\n\n``path_prefix`` is a literal prefix match on the memory path. ``depth``\ngroups deeper paths into ``MemoryPrefix`` entries (directory-style\nlistings) \u2014 entries past the depth boundary are collapsed into a\nsingle prefix entry per shared directory. ``order_by`` accepts\n``created_at`` (default) or ``path``. ``limit`` caps the raw-row\nfetch (cursor pagination not yet supported; use ``path_prefix`` to\nnarrow scope when a store has thousands of memories).",
+        "description": "List memories in a store, optionally filtered and grouped by path.\n\n``path_prefix`` is a literal prefix match on the memory path. ``depth``\ngroups deeper paths into ``MemoryPrefix`` entries (directory-style\nlistings) \u2014 entries past the depth boundary are collapsed into a\nsingle prefix entry per shared directory. ``order_by`` accepts\n``created_at`` (default) or ``path``.\n\nWith ``order_by=path`` and no ``depth``, the listing is\ncursor-paginated: walk ``?cursor=<next_cursor>`` pages to enumerate a\nstore completely (``aios export`` relies on this). ``created_at``\nordering and depth-grouped listings remain single-shot (``limit``\ncaps the raw-row fetch; ``has_more`` signals the cap was hit).",
         "operationId": "list_memories",
         "parameters": [
           {
@@ -5311,6 +5380,22 @@
             "schema": {
               "type": "string",
               "title": "Store Id"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
             }
           },
           {
@@ -5360,10 +5445,16 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "integer",
-              "maximum": 200,
-              "minimum": 1,
-              "default": 100,
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 200,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
               "title": "Limit"
             }
           },
@@ -5617,7 +5708,7 @@
           "memory-stores"
         ],
         "summary": "List Versions",
-        "description": "List memory versions in a store, newest first.\n\nOptional ``memory_id`` filters to a single memory's version history.\nWithout the filter, returns versions across all memories in the store\n(useful for audit). No cursor pagination; bumps default limit to 100.",
+        "description": "List memory versions in a store, newest first (cursor-paginated).\n\nOptional ``memory_id`` filters to a single memory's version history.\nWithout the filter, returns versions across all memories in the store\n(useful for audit). ``include_content=true`` inlines each version's\ncontent snapshot (redacted versions stay null) \u2014 used by ``aios\nexport`` to capture full history. First page: filters + ``?limit=``;\nsubsequent pages: ``?cursor=<next_cursor>``.",
         "operationId": "list_memory_versions",
         "parameters": [
           {
@@ -5627,6 +5718,22 @@
             "schema": {
               "type": "string",
               "title": "Store Id"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
             }
           },
           {
@@ -5646,14 +5753,30 @@
             }
           },
           {
+            "name": "include_content",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Include Content"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "required": false,
             "schema": {
-              "type": "integer",
-              "maximum": 200,
-              "minimum": 1,
-              "default": 100,
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 200,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
               "title": "Limit"
             }
           },
@@ -9786,6 +9909,104 @@
         "title": "Event",
         "description": "Read view of a single event from the session log."
       },
+      "EventImport": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^evt_[0-9A-HJKMNP-TV-Z]{26}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id",
+            "description": "Original event id (prefixed ULID). Omit to mint a new one."
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Seq"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "message",
+              "lifecycle",
+              "span",
+              "interrupt"
+            ],
+            "title": "Kind"
+          },
+          "data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At",
+            "description": "Original creation time. Omit to stamp now()."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "seq",
+          "kind",
+          "data"
+        ],
+        "title": "EventImport",
+        "description": "One historical event in an ``events:import`` batch.\n\nCarries exactly the fields the public :class:`Event` read view exposes\n(the internal channel/cumulative-token stamps are derived or nulled on\ninsert \u2014 see ``queries.import_events``). ``id`` keeps the source\ndeployment's event id; omit it to have the server mint a fresh one."
+      },
+      "EventsImportRequest": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EventImport"
+            },
+            "type": "array",
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Events"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "events"
+        ],
+        "title": "EventsImportRequest",
+        "description": "Request body for ``POST /v1/sessions/{id}/events:import``.\n\nThe batch must be strictly consecutive (``events[i].seq ==\nevents[0].seq + i``); the server additionally requires\n``events[0].seq == session.last_event_seq + 1`` so the gapless-seq\ninvariant holds by construction."
+      },
+      "EventsImportResponse": {
+        "properties": {
+          "imported": {
+            "type": "integer",
+            "title": "Imported"
+          },
+          "last_seq": {
+            "type": "integer",
+            "title": "Last Seq"
+          }
+        },
+        "type": "object",
+        "required": [
+          "imported",
+          "last_seq"
+        ],
+        "title": "EventsImportResponse",
+        "description": "Response for ``POST /v1/sessions/{id}/events:import``."
+      },
       "FileUploadResponse": {
         "properties": {
           "file_id": {
@@ -11340,6 +11561,10 @@
             "type": "string",
             "title": "Memory Id"
           },
+          "seq": {
+            "type": "integer",
+            "title": "Seq"
+          },
           "operation": {
             "type": "string",
             "enum": [
@@ -11429,6 +11654,7 @@
           "id",
           "memory_store_id",
           "memory_id",
+          "seq",
           "operation",
           "created_by",
           "created_at"

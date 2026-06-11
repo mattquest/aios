@@ -35,7 +35,7 @@ from aios.errors import SSEPreflightFailedError, ValidationError
 from aios.ids import GITHUB_REPOSITORY, split_id
 from aios.logging import get_logger
 from aios.models.common import ListResponse
-from aios.models.events import Event, EventKind
+from aios.models.events import Event, EventKind, EventsImportRequest, EventsImportResponse
 from aios.models.files import FileUploadResponse
 from aios.models.github_repositories import (
     GithubRepositoryResourceEcho,
@@ -591,6 +591,37 @@ async def list_events(
         direction=direction,
         filters={"kind": kind, "error_only": error_only},
     )
+
+
+@router.post(
+    "/{session_id}/events:import",
+    operation_id="import_session_events",
+    status_code=status.HTTP_201_CREATED,
+)
+async def import_events(
+    session_id: str,
+    body: EventsImportRequest,
+    pool: PoolDep,
+    account_id: AccountIdDep,
+) -> EventsImportResponse:
+    """Bulk-insert historical events into a session (data import).
+
+    The write surface behind ``aios import``: events exported from another
+    deployment are re-inserted with their original ids, seqs, and
+    timestamps. The batch must continue exactly at the session's current
+    ``last_event_seq + 1`` and be strictly consecutive — the gapless-seq
+    invariant is validated, never bypassed. Large histories are imported
+    as multiple consecutive batches.
+
+    Unlike ``POST /messages`` this appends no wake job and emits no SSE
+    notify: importing a log must not start inference. The channel stamps
+    (``orig_channel``/``channel``) are not part of the public event shape
+    and are stamped NULL; everything else (search columns, cumulative
+    token counts) is re-derived from ``data`` exactly as the live append
+    path would.
+    """
+    imported = await service.import_events(pool, session_id, body.events, account_id=account_id)
+    return EventsImportResponse(imported=imported, last_seq=body.events[-1].seq)
 
 
 @router.get("/{session_id}/events/{event_id}", operation_id="get_session_event")

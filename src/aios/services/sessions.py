@@ -26,7 +26,7 @@ from aios.models.agents import (
     is_mcp_tool_name,
     resolve_permission,
 )
-from aios.models.events import Event, EventKind
+from aios.models.events import Event, EventImport, EventKind
 from aios.models.scheduled_tasks import (
     ScheduledTaskCreate,
     compute_initial_next_fire,
@@ -450,6 +450,24 @@ async def append_event(
     async with pool.acquire() as conn:
         return await queries.append_event(
             conn, session_id=session_id, kind=kind, data=data, account_id=account_id
+        )
+
+
+async def import_events(
+    pool: asyncpg.Pool[Any],
+    session_id: str,
+    events: list[EventImport],
+    *,
+    account_id: str,
+) -> int:
+    """Bulk-insert historical events for data import (``aios import``).
+
+    Validates and preserves the gapless-seq invariant; see
+    :func:`queries.import_events` for the full contract.
+    """
+    async with pool.acquire() as conn:
+        return await queries.import_events(
+            conn, account_id=account_id, session_id=session_id, events=events
         )
 
 

@@ -58,7 +58,7 @@ from aios.models.accounts import Account
 from aios.models.agents import Agent, AgentVersion, HttpServerSpec, McpServerSpec, ToolSpec
 from aios.models.connections import BindingMode, Connection, ConnectionMode
 from aios.models.environments import Environment, EnvironmentConfig
-from aios.models.events import Event, EventKind
+from aios.models.events import Event, EventImport, EventKind
 from aios.models.files import File
 from aios.models.github_repositories import GithubRepositoryResourceEcho
 from aios.models.memory_stores import (
@@ -2349,6 +2349,113 @@ async def append_event(
                 f"{session_id}|{cid}",
             )
     return _row_to_event(row)
+
+
+async def import_events(
+    conn: asyncpg.Connection[Any],
+    *,
+    account_id: str,
+    session_id: str,
+    events: list[EventImport],
+) -> int:
+    """Bulk-insert historical events with caller-supplied seqs (data import).
+
+    The write path behind ``POST /v1/sessions/{id}/events:import`` — the
+    server side of ``aios import``. Same locking discipline as
+    :func:`append_event`: the session row is locked for the whole batch,
+    the batch must start at ``last_event_seq + 1`` (the pydantic model
+    already guarantees the batch itself is strictly consecutive), and
+    ``last_event_seq`` is advanced to the batch tail in the same
+    transaction — the gapless-seq invariant holds by construction.
+
+    Differences from the live append path, all deliberate for a bulk
+    historical load:
+
+    * No ``pg_notify`` and no wake deferral — importing a log must not
+      start inference. (A worker's periodic sweep may still wake the
+      session afterwards if the imported log ends with an unreacted user
+      message — identical to how a live session with a pending user
+      message behaves.)
+    * No auto-title derivation — the importing client recreates the
+      session with its exported title.
+    * ``orig_channel`` / ``focal_channel_at_arrival`` / ``channel`` are
+      stamped NULL: the public :class:`Event` read view (what an export
+      contains) does not carry the channel stamps, so they are not
+      reconstructible. Imported history renders channel-less.
+    * ``cumulative_tokens`` is recomputed from the imported data with the
+      same ``approx_tokens`` counter the append path uses.
+
+    The promoted search columns (``role`` / ``tool_name`` / ``is_error`` /
+    ``sender_name``) are re-derived from ``data`` with the exact helpers
+    the append path uses, so imported rows are search-equivalent.
+
+    Raises :class:`ConflictError` when the batch does not continue at
+    ``last_event_seq + 1`` or when a supplied event id already exists.
+    """
+    from aios.harness.tokens import approx_tokens
+
+    async with conn.transaction():
+        row = await conn.fetchrow(
+            "SELECT last_event_seq FROM sessions "
+            "WHERE id = $1 AND account_id = $2 AND archived_at IS NULL "
+            "FOR UPDATE",
+            session_id,
+            account_id,
+        )
+        if row is None:
+            raise NotFoundError(f"session {session_id} not found", detail={"id": session_id})
+        last_seq: int = row["last_event_seq"]
+        if events[0].seq != last_seq + 1:
+            raise ConflictError(
+                f"import batch must start at seq {last_seq + 1} "
+                f"(session last_event_seq is {last_seq}), got {events[0].seq}",
+                detail={"last_event_seq": last_seq, "batch_first_seq": events[0].seq},
+            )
+
+        prev_cum = await _latest_cumulative_tokens(conn, session_id)
+        for event in events:
+            cum_tokens: int | None = None
+            role: str | None = None
+            if event.kind == "message":
+                raw_role = event.data.get("role")
+                if isinstance(raw_role, str):
+                    role = raw_role
+                prev_cum = (prev_cum or 0) + approx_tokens([event.data])
+                cum_tokens = prev_cum
+            try:
+                await conn.execute(
+                    "INSERT INTO events "
+                    "(id, session_id, seq, kind, data, cumulative_tokens, "
+                    " orig_channel, focal_channel_at_arrival, channel, "
+                    " role, tool_name, is_error, sender_name, account_id, created_at) "
+                    "VALUES ($1, $2, $3, $4, $5::jsonb, $6, NULL, NULL, NULL, "
+                    " $7, $8, $9, $10, $11, COALESCE($12, now()))",
+                    event.id or make_id(EVENT),
+                    session_id,
+                    event.seq,
+                    event.kind,
+                    json.dumps(event.data),
+                    cum_tokens,
+                    role,
+                    _derive_tool_name(event.kind, event.data),
+                    _derive_is_error(event.kind, event.data),
+                    _derive_sender_name(event.kind, event.data),
+                    account_id,
+                    event.created_at,
+                )
+            except asyncpg.UniqueViolationError as exc:
+                raise ConflictError(
+                    f"event id {event.id} already exists",
+                    detail={"id": event.id, "seq": event.seq},
+                ) from exc
+        await conn.execute(
+            "UPDATE sessions SET last_event_seq = $3, updated_at = now() "
+            "WHERE id = $1 AND account_id = $2",
+            session_id,
+            account_id,
+            events[-1].seq,
+        )
+    return len(events)
 
 
 async def list_pending_calls_for_connector(
@@ -5198,6 +5305,7 @@ def _row_to_memory_version(row: asyncpg.Record, *, include_content: bool) -> Mem
         id=row["id"],
         memory_store_id=row["memory_store_id"],
         memory_id=row["memory_id"],
+        seq=row["seq"],
         operation=row["operation"],
         path=row["path"],
         content=row["content"] if include_content and not redacted else None,
@@ -5556,6 +5664,7 @@ async def list_memories(
     order_by: str = "created_at",
     depth: int | None = None,
     limit: int = 100,
+    after_path: str | None = None,
 ) -> list[Memory | MemoryPrefix]:
     """List memories, optionally filtered by ``path_prefix`` and depth-clipped.
 
@@ -5565,12 +5674,17 @@ async def list_memories(
     ``limit`` caps the raw-row fetch — depth aggregation may then collapse
     that into fewer response entries, but the SQL bound prevents unbounded
     payloads on stores with thousands of memories.
+
+    ``after_path`` is the keyset for cursor pagination (``path > $after``);
+    only meaningful with ``order_by='path'``, where ``path`` is the unique,
+    stable sort key (enforced at the router, asserted here).
     """
     if depth is not None and order_by != "path":
         raise ConflictError(
             "depth requires order_by=path",
             detail={"order_by": order_by, "depth": depth},
         )
+    assert after_path is None or order_by == "path", "after_path requires order_by=path"
 
     where = "memory_store_id = $1 AND deleted_at IS NULL AND account_id = $2"
     args: list[Any] = [store_id, account_id]
@@ -5580,6 +5694,9 @@ async def list_memories(
         # legitimately contain ``_`` and ``%`` per the schema CHECK regex.
         args.append(_escape_like(path_prefix))
         where += f" AND (path = ${len(args) - 1} OR path LIKE ${len(args)} || '%')"
+    if after_path is not None:
+        args.append(after_path)
+        where += f" AND path > ${len(args)}"
     order_sql = "path ASC" if order_by == "path" else "created_at DESC"
     args.append(limit)
     rows = await conn.fetch(
@@ -5785,27 +5902,34 @@ async def list_memory_versions(
     account_id: str,
     memory_id: str | None = None,
     limit: int = 100,
+    before_seq: int | None = None,
+    include_content: bool = False,
 ) -> list[MemoryVersion]:
     args: list[Any] = [store_id, account_id]
     where = "memory_store_id = $1 AND account_id = $2"
     if memory_id is not None:
         args.append(memory_id)
         where += f" AND memory_id = ${len(args)}"
+    if before_seq is not None:
+        # Keyset for newest-first cursor pagination: pages walk seq
+        # strictly downward, so ``seq`` (per-store-monotonic, unique)
+        # is the cursor.
+        args.append(before_seq)
+        where += f" AND seq < ${len(args)}"
     args.append(limit)
-    # ``seq DESC`` is the load-bearing tiebreaker: ``created_at`` defaults
+    # ``seq DESC`` is the load-bearing ordering: ``created_at`` defaults
     # to transaction-start ``now()``, so rows written in the same
     # transaction (any bulk-edit flow, e.g. multiple ``update_memory``
     # calls under one HTTP request) share ``created_at`` to the
     # microsecond. The ``UNIQUE (memory_store_id, seq)`` constraint makes
     # ``seq`` per-store-monotonic and unambiguous, and it's allocated in
-    # write order by ``_allocate_version_seq`` — so ``seq DESC`` agrees
-    # with "newest first" within the tied group.
+    # write order by ``_allocate_version_seq`` — so ``seq DESC`` IS
+    # "newest first", with no ambiguity for the keyset to trip over.
     rows = await conn.fetch(
-        f"SELECT * FROM memory_versions WHERE {where} "
-        f"ORDER BY created_at DESC, seq DESC LIMIT ${len(args)}",
+        f"SELECT * FROM memory_versions WHERE {where} ORDER BY seq DESC LIMIT ${len(args)}",
         *args,
     )
-    return [_row_to_memory_version(r, include_content=False) for r in rows]
+    return [_row_to_memory_version(r, include_content=include_content) for r in rows]
 
 
 async def get_memory_version(

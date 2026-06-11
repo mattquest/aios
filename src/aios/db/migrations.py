@@ -28,6 +28,24 @@ def upgrade_to_head(db_url: str, target: str = "head") -> None:
         command.upgrade(cfg, target)
 
 
+def code_head_revision() -> str:
+    """The head revision id of the migration scripts shipped with this code.
+
+    Used by ``aios doctor`` (compared against the database's
+    ``alembic_version``) and stamped into the ``aios export`` manifest.
+    Reads the script directory only — no database access.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    cfg = Config(str(_REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(_REPO_ROOT / "migrations"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    if head is None:
+        raise RuntimeError(f"no migration scripts found under {_REPO_ROOT / 'migrations'}")
+    return head
+
+
 async def apply_procrastinate_schema(db_url: str, *, verbose: bool = False) -> None:
     """Apply procrastinate's schema (if missing) and the aios lock-release
     trigger against ``db_url``. Idempotent — safe on an already-migrated DB.

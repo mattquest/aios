@@ -280,6 +280,8 @@ Every resource has CRUD subcommands. See `aios <resource> --help`.
 | `aios api` / `aios worker` / `aios migrate` | Operator (start servers, run migrations) |
 | `aios dev …` | Per-worktree dev instance lifecycle |
 | `aios status` | API reachability + auth probe |
+| `aios doctor` | Deployment preflight (Docker, sandbox image, DB schema, worker, keys) |
+| `aios export` / `aios import` | Account data portability — see [docs/PORTABILITY.md](docs/PORTABILITY.md) |
 | `aios chat` | Interactive REPL / one-shot send-and-stream |
 | `aios tail` | Multi-session live tail with formatting |
 | `aios agents`, `aios sessions`, `aios session-templates` | Core resources |

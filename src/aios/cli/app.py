@@ -99,8 +99,10 @@ from aios.cli.commands import assistant as _assistant  # noqa: E402
 from aios.cli.commands import chat as _chat  # noqa: E402
 from aios.cli.commands import connections as _connections  # noqa: E402
 from aios.cli.commands import dev as _dev  # noqa: E402
+from aios.cli.commands import doctor as _doctor  # noqa: E402
 from aios.cli.commands import envs as _envs  # noqa: E402
 from aios.cli.commands import ops as _ops  # noqa: E402
+from aios.cli.commands import portability as _portability  # noqa: E402
 from aios.cli.commands import runtime_tokens as _runtime_tokens  # noqa: E402
 from aios.cli.commands import session_templates as _session_templates  # noqa: E402
 from aios.cli.commands import sessions as _sessions  # noqa: E402
@@ -131,3 +133,5 @@ _status.register(app)
 _chat.register(app)
 _tail.register(app)
 _usage.register(app)
+_doctor.register(app)
+_portability.register(app)

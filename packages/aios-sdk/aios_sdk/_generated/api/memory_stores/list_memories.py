@@ -16,10 +16,11 @@ from ...types import UNSET, Response, Unset
 def _get_kwargs(
     store_id: str,
     *,
+    cursor: None | str | Unset = UNSET,
     path_prefix: None | str | Unset = UNSET,
     order_by: str | Unset = "created_at",
     depth: int | None | Unset = UNSET,
-    limit: int | Unset = 100,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
@@ -27,6 +28,13 @@ def _get_kwargs(
         headers["Authorization"] = authorization
 
     params: dict[str, Any] = {}
+
+    json_cursor: None | str | Unset
+    if isinstance(cursor, Unset):
+        json_cursor = UNSET
+    else:
+        json_cursor = cursor
+    params["cursor"] = json_cursor
 
     json_path_prefix: None | str | Unset
     if isinstance(path_prefix, Unset):
@@ -44,7 +52,12 @@ def _get_kwargs(
         json_depth = depth
     params["depth"] = json_depth
 
-    params["limit"] = limit
+    json_limit: int | None | Unset
+    if isinstance(limit, Unset):
+        json_limit = UNSET
+    else:
+        json_limit = limit
+    params["limit"] = json_limit
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -94,10 +107,11 @@ def sync_detailed(
     store_id: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: None | str | Unset = UNSET,
     path_prefix: None | str | Unset = UNSET,
     order_by: str | Unset = "created_at",
     depth: int | None | Unset = UNSET,
-    limit: int | Unset = 100,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> Response[HTTPValidationError | ListResponseUnionMemoryMemoryPrefix]:
     """List Memories
@@ -108,16 +122,21 @@ def sync_detailed(
     groups deeper paths into ``MemoryPrefix`` entries (directory-style
     listings) — entries past the depth boundary are collapsed into a
     single prefix entry per shared directory. ``order_by`` accepts
-    ``created_at`` (default) or ``path``. ``limit`` caps the raw-row
-    fetch (cursor pagination not yet supported; use ``path_prefix`` to
-    narrow scope when a store has thousands of memories).
+    ``created_at`` (default) or ``path``.
+
+    With ``order_by=path`` and no ``depth``, the listing is
+    cursor-paginated: walk ``?cursor=<next_cursor>`` pages to enumerate a
+    store completely (``aios export`` relies on this). ``created_at``
+    ordering and depth-grouped listings remain single-shot (``limit``
+    caps the raw-row fetch; ``has_more`` signals the cap was hit).
 
     Args:
         store_id (str):
+        cursor (None | str | Unset):
         path_prefix (None | str | Unset):
         order_by (str | Unset):  Default: 'created_at'.
         depth (int | None | Unset):
-        limit (int | Unset):  Default: 100.
+        limit (int | None | Unset):
         authorization (None | str | Unset):
 
     Raises:
@@ -130,6 +149,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         store_id=store_id,
+        cursor=cursor,
         path_prefix=path_prefix,
         order_by=order_by,
         depth=depth,
@@ -148,10 +168,11 @@ def sync(
     store_id: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: None | str | Unset = UNSET,
     path_prefix: None | str | Unset = UNSET,
     order_by: str | Unset = "created_at",
     depth: int | None | Unset = UNSET,
-    limit: int | Unset = 100,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> HTTPValidationError | ListResponseUnionMemoryMemoryPrefix | None:
     """List Memories
@@ -162,16 +183,21 @@ def sync(
     groups deeper paths into ``MemoryPrefix`` entries (directory-style
     listings) — entries past the depth boundary are collapsed into a
     single prefix entry per shared directory. ``order_by`` accepts
-    ``created_at`` (default) or ``path``. ``limit`` caps the raw-row
-    fetch (cursor pagination not yet supported; use ``path_prefix`` to
-    narrow scope when a store has thousands of memories).
+    ``created_at`` (default) or ``path``.
+
+    With ``order_by=path`` and no ``depth``, the listing is
+    cursor-paginated: walk ``?cursor=<next_cursor>`` pages to enumerate a
+    store completely (``aios export`` relies on this). ``created_at``
+    ordering and depth-grouped listings remain single-shot (``limit``
+    caps the raw-row fetch; ``has_more`` signals the cap was hit).
 
     Args:
         store_id (str):
+        cursor (None | str | Unset):
         path_prefix (None | str | Unset):
         order_by (str | Unset):  Default: 'created_at'.
         depth (int | None | Unset):
-        limit (int | Unset):  Default: 100.
+        limit (int | None | Unset):
         authorization (None | str | Unset):
 
     Raises:
@@ -185,6 +211,7 @@ def sync(
     return sync_detailed(
         store_id=store_id,
         client=client,
+        cursor=cursor,
         path_prefix=path_prefix,
         order_by=order_by,
         depth=depth,
@@ -197,10 +224,11 @@ async def asyncio_detailed(
     store_id: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: None | str | Unset = UNSET,
     path_prefix: None | str | Unset = UNSET,
     order_by: str | Unset = "created_at",
     depth: int | None | Unset = UNSET,
-    limit: int | Unset = 100,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> Response[HTTPValidationError | ListResponseUnionMemoryMemoryPrefix]:
     """List Memories
@@ -211,16 +239,21 @@ async def asyncio_detailed(
     groups deeper paths into ``MemoryPrefix`` entries (directory-style
     listings) — entries past the depth boundary are collapsed into a
     single prefix entry per shared directory. ``order_by`` accepts
-    ``created_at`` (default) or ``path``. ``limit`` caps the raw-row
-    fetch (cursor pagination not yet supported; use ``path_prefix`` to
-    narrow scope when a store has thousands of memories).
+    ``created_at`` (default) or ``path``.
+
+    With ``order_by=path`` and no ``depth``, the listing is
+    cursor-paginated: walk ``?cursor=<next_cursor>`` pages to enumerate a
+    store completely (``aios export`` relies on this). ``created_at``
+    ordering and depth-grouped listings remain single-shot (``limit``
+    caps the raw-row fetch; ``has_more`` signals the cap was hit).
 
     Args:
         store_id (str):
+        cursor (None | str | Unset):
         path_prefix (None | str | Unset):
         order_by (str | Unset):  Default: 'created_at'.
         depth (int | None | Unset):
-        limit (int | Unset):  Default: 100.
+        limit (int | None | Unset):
         authorization (None | str | Unset):
 
     Raises:
@@ -233,6 +266,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         store_id=store_id,
+        cursor=cursor,
         path_prefix=path_prefix,
         order_by=order_by,
         depth=depth,
@@ -249,10 +283,11 @@ async def asyncio(
     store_id: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: None | str | Unset = UNSET,
     path_prefix: None | str | Unset = UNSET,
     order_by: str | Unset = "created_at",
     depth: int | None | Unset = UNSET,
-    limit: int | Unset = 100,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> HTTPValidationError | ListResponseUnionMemoryMemoryPrefix | None:
     """List Memories
@@ -263,16 +298,21 @@ async def asyncio(
     groups deeper paths into ``MemoryPrefix`` entries (directory-style
     listings) — entries past the depth boundary are collapsed into a
     single prefix entry per shared directory. ``order_by`` accepts
-    ``created_at`` (default) or ``path``. ``limit`` caps the raw-row
-    fetch (cursor pagination not yet supported; use ``path_prefix`` to
-    narrow scope when a store has thousands of memories).
+    ``created_at`` (default) or ``path``.
+
+    With ``order_by=path`` and no ``depth``, the listing is
+    cursor-paginated: walk ``?cursor=<next_cursor>`` pages to enumerate a
+    store completely (``aios export`` relies on this). ``created_at``
+    ordering and depth-grouped listings remain single-shot (``limit``
+    caps the raw-row fetch; ``has_more`` signals the cap was hit).
 
     Args:
         store_id (str):
+        cursor (None | str | Unset):
         path_prefix (None | str | Unset):
         order_by (str | Unset):  Default: 'created_at'.
         depth (int | None | Unset):
-        limit (int | Unset):  Default: 100.
+        limit (int | None | Unset):
         authorization (None | str | Unset):
 
     Raises:
@@ -287,6 +327,7 @@ async def asyncio(
         await asyncio_detailed(
             store_id=store_id,
             client=client,
+            cursor=cursor,
             path_prefix=path_prefix,
             order_by=order_by,
             depth=depth,

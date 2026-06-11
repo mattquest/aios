@@ -34,6 +34,7 @@ class MemoryVersion:
             id (str):
             memory_store_id (str):
             memory_id (str):
+            seq (int):
             operation (MemoryVersionOperation):
             created_by (Actor): ``created_by`` / ``redacted_by`` shape on memory versions.
             created_at (datetime.datetime):
@@ -49,6 +50,7 @@ class MemoryVersion:
     id: str
     memory_store_id: str
     memory_id: str
+    seq: int
     operation: MemoryVersionOperation
     created_by: Actor
     created_at: datetime.datetime
@@ -69,6 +71,8 @@ class MemoryVersion:
         memory_store_id = self.memory_store_id
 
         memory_id = self.memory_id
+
+        seq = self.seq
 
         operation = self.operation.value
 
@@ -125,6 +129,7 @@ class MemoryVersion:
                 "id": id,
                 "memory_store_id": memory_store_id,
                 "memory_id": memory_id,
+                "seq": seq,
                 "operation": operation,
                 "created_by": created_by,
                 "created_at": created_at,
@@ -157,6 +162,8 @@ class MemoryVersion:
         memory_store_id = d.pop("memory_store_id")
 
         memory_id = d.pop("memory_id")
+
+        seq = d.pop("seq")
 
         operation = MemoryVersionOperation(d.pop("operation"))
 
@@ -244,6 +251,7 @@ class MemoryVersion:
             id=id,
             memory_store_id=memory_store_id,
             memory_id=memory_id,
+            seq=seq,
             operation=operation,
             created_by=created_by,
             created_at=created_at,

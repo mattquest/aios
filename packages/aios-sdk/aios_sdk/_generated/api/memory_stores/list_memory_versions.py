@@ -14,8 +14,10 @@ from ...types import UNSET, Response, Unset
 def _get_kwargs(
     store_id: str,
     *,
+    cursor: None | str | Unset = UNSET,
     memory_id: None | str | Unset = UNSET,
-    limit: int | Unset = 100,
+    include_content: bool | Unset = False,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
@@ -24,6 +26,13 @@ def _get_kwargs(
 
     params: dict[str, Any] = {}
 
+    json_cursor: None | str | Unset
+    if isinstance(cursor, Unset):
+        json_cursor = UNSET
+    else:
+        json_cursor = cursor
+    params["cursor"] = json_cursor
+
     json_memory_id: None | str | Unset
     if isinstance(memory_id, Unset):
         json_memory_id = UNSET
@@ -31,7 +40,14 @@ def _get_kwargs(
         json_memory_id = memory_id
     params["memory_id"] = json_memory_id
 
-    params["limit"] = limit
+    params["include_content"] = include_content
+
+    json_limit: int | None | Unset
+    if isinstance(limit, Unset):
+        json_limit = UNSET
+    else:
+        json_limit = limit
+    params["limit"] = json_limit
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -81,22 +97,29 @@ def sync_detailed(
     store_id: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: None | str | Unset = UNSET,
     memory_id: None | str | Unset = UNSET,
-    limit: int | Unset = 100,
+    include_content: bool | Unset = False,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> Response[HTTPValidationError | ListResponseMemoryVersion]:
     """List Versions
 
-     List memory versions in a store, newest first.
+     List memory versions in a store, newest first (cursor-paginated).
 
     Optional ``memory_id`` filters to a single memory's version history.
     Without the filter, returns versions across all memories in the store
-    (useful for audit). No cursor pagination; bumps default limit to 100.
+    (useful for audit). ``include_content=true`` inlines each version's
+    content snapshot (redacted versions stay null) — used by ``aios
+    export`` to capture full history. First page: filters + ``?limit=``;
+    subsequent pages: ``?cursor=<next_cursor>``.
 
     Args:
         store_id (str):
+        cursor (None | str | Unset):
         memory_id (None | str | Unset):
-        limit (int | Unset):  Default: 100.
+        include_content (bool | Unset):  Default: False.
+        limit (int | None | Unset):
         authorization (None | str | Unset):
 
     Raises:
@@ -109,7 +132,9 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         store_id=store_id,
+        cursor=cursor,
         memory_id=memory_id,
+        include_content=include_content,
         limit=limit,
         authorization=authorization,
     )
@@ -125,22 +150,29 @@ def sync(
     store_id: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: None | str | Unset = UNSET,
     memory_id: None | str | Unset = UNSET,
-    limit: int | Unset = 100,
+    include_content: bool | Unset = False,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> HTTPValidationError | ListResponseMemoryVersion | None:
     """List Versions
 
-     List memory versions in a store, newest first.
+     List memory versions in a store, newest first (cursor-paginated).
 
     Optional ``memory_id`` filters to a single memory's version history.
     Without the filter, returns versions across all memories in the store
-    (useful for audit). No cursor pagination; bumps default limit to 100.
+    (useful for audit). ``include_content=true`` inlines each version's
+    content snapshot (redacted versions stay null) — used by ``aios
+    export`` to capture full history. First page: filters + ``?limit=``;
+    subsequent pages: ``?cursor=<next_cursor>``.
 
     Args:
         store_id (str):
+        cursor (None | str | Unset):
         memory_id (None | str | Unset):
-        limit (int | Unset):  Default: 100.
+        include_content (bool | Unset):  Default: False.
+        limit (int | None | Unset):
         authorization (None | str | Unset):
 
     Raises:
@@ -154,7 +186,9 @@ def sync(
     return sync_detailed(
         store_id=store_id,
         client=client,
+        cursor=cursor,
         memory_id=memory_id,
+        include_content=include_content,
         limit=limit,
         authorization=authorization,
     ).parsed
@@ -164,22 +198,29 @@ async def asyncio_detailed(
     store_id: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: None | str | Unset = UNSET,
     memory_id: None | str | Unset = UNSET,
-    limit: int | Unset = 100,
+    include_content: bool | Unset = False,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> Response[HTTPValidationError | ListResponseMemoryVersion]:
     """List Versions
 
-     List memory versions in a store, newest first.
+     List memory versions in a store, newest first (cursor-paginated).
 
     Optional ``memory_id`` filters to a single memory's version history.
     Without the filter, returns versions across all memories in the store
-    (useful for audit). No cursor pagination; bumps default limit to 100.
+    (useful for audit). ``include_content=true`` inlines each version's
+    content snapshot (redacted versions stay null) — used by ``aios
+    export`` to capture full history. First page: filters + ``?limit=``;
+    subsequent pages: ``?cursor=<next_cursor>``.
 
     Args:
         store_id (str):
+        cursor (None | str | Unset):
         memory_id (None | str | Unset):
-        limit (int | Unset):  Default: 100.
+        include_content (bool | Unset):  Default: False.
+        limit (int | None | Unset):
         authorization (None | str | Unset):
 
     Raises:
@@ -192,7 +233,9 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         store_id=store_id,
+        cursor=cursor,
         memory_id=memory_id,
+        include_content=include_content,
         limit=limit,
         authorization=authorization,
     )
@@ -206,22 +249,29 @@ async def asyncio(
     store_id: str,
     *,
     client: AuthenticatedClient | Client,
+    cursor: None | str | Unset = UNSET,
     memory_id: None | str | Unset = UNSET,
-    limit: int | Unset = 100,
+    include_content: bool | Unset = False,
+    limit: int | None | Unset = UNSET,
     authorization: None | str | Unset = UNSET,
 ) -> HTTPValidationError | ListResponseMemoryVersion | None:
     """List Versions
 
-     List memory versions in a store, newest first.
+     List memory versions in a store, newest first (cursor-paginated).
 
     Optional ``memory_id`` filters to a single memory's version history.
     Without the filter, returns versions across all memories in the store
-    (useful for audit). No cursor pagination; bumps default limit to 100.
+    (useful for audit). ``include_content=true`` inlines each version's
+    content snapshot (redacted versions stay null) — used by ``aios
+    export`` to capture full history. First page: filters + ``?limit=``;
+    subsequent pages: ``?cursor=<next_cursor>``.
 
     Args:
         store_id (str):
+        cursor (None | str | Unset):
         memory_id (None | str | Unset):
-        limit (int | Unset):  Default: 100.
+        include_content (bool | Unset):  Default: False.
+        limit (int | None | Unset):
         authorization (None | str | Unset):
 
     Raises:
@@ -236,7 +286,9 @@ async def asyncio(
         await asyncio_detailed(
             store_id=store_id,
             client=client,
+            cursor=cursor,
             memory_id=memory_id,
+            include_content=include_content,
             limit=limit,
             authorization=authorization,
         )

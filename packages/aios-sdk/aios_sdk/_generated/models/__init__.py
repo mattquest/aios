@@ -50,7 +50,12 @@ from .environment_create import EnvironmentCreate
 from .environment_update import EnvironmentUpdate
 from .event import Event
 from .event_data import EventData
+from .event_import import EventImport
+from .event_import_data import EventImportData
+from .event_import_kind import EventImportKind
 from .event_kind import EventKind
+from .events_import_request import EventsImportRequest
+from .events_import_response import EventsImportResponse
 from .file_upload_response import FileUploadResponse
 from .get_health_ready_response_get_health_ready import (
     GetHealthReadyResponseGetHealthReady,
@@ -291,7 +296,12 @@ __all__ = (
     "EnvironmentUpdate",
     "Event",
     "EventData",
+    "EventImport",
+    "EventImportData",
+    "EventImportKind",
     "EventKind",
+    "EventsImportRequest",
+    "EventsImportResponse",
     "FileUploadResponse",
     "GetHealthReadyResponseGetHealthReady",
     "GetHealthReadyV1ResponseGetHealthReadyV1",

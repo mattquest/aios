@@ -169,10 +169,11 @@ async def list_memories(
     store_id: str,
     pool: PoolDep,
     account_id: AccountIdDep,
+    cursor: str | None = None,
     path_prefix: str | None = None,
     order_by: str = "created_at",
     depth: int | None = None,
-    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    limit: Annotated[int | None, Query(ge=1, le=200)] = None,
 ) -> ListResponse[Memory | MemoryPrefix]:
     """List memories in a store, optionally filtered and grouped by path.
 
@@ -180,25 +181,59 @@ async def list_memories(
     groups deeper paths into ``MemoryPrefix`` entries (directory-style
     listings) — entries past the depth boundary are collapsed into a
     single prefix entry per shared directory. ``order_by`` accepts
-    ``created_at`` (default) or ``path``. ``limit`` caps the raw-row
-    fetch (cursor pagination not yet supported; use ``path_prefix`` to
-    narrow scope when a store has thousands of memories).
+    ``created_at`` (default) or ``path``.
+
+    With ``order_by=path`` and no ``depth``, the listing is
+    cursor-paginated: walk ``?cursor=<next_cursor>`` pages to enumerate a
+    store completely (``aios export`` relies on this). ``created_at``
+    ordering and depth-grouped listings remain single-shot (``limit``
+    caps the raw-row fetch; ``has_more`` signals the cap was hit).
     """
+    st = page_cursor(
+        cursor,
+        {
+            "path_prefix": path_prefix,
+            "order_by": order_by if order_by != "created_at" else None,
+            "depth": depth,
+            "limit": limit,
+        },
+    )
+    after_path: str | None = None
+    if st is not None:
+        # Cursors are only minted on the flat path-ordered listing.
+        path_prefix = st.filters.get("path_prefix")
+        order_by = "path"
+        depth = None
+        page_limit = st.limit
+        after_path = str(st.cursor)
+    else:
+        page_limit = limit if limit is not None else 100
+
+    paginated = order_by == "path" and depth is None
     items = await service.list_memories(
         pool,
         store_id,
         path_prefix=path_prefix,
         order_by=order_by,
         depth=depth,
-        limit=limit,
+        limit=page_limit + 1 if paginated else page_limit,
+        after_path=after_path,
         account_id=account_id,
     )
+    if paginated:
+        return ListResponse[Memory | MemoryPrefix].paginate(
+            items,
+            page_limit,
+            cursor=lambda x: x.path,
+            direction="forward",
+            filters={"path_prefix": path_prefix},
+        )
     # ``has_more`` signals the SQL cap was hit; depth aggregation may have
     # collapsed those raw rows into fewer response entries, so compare the
     # underlying memory count (entries that aren't MemoryPrefix) plus
     # collapsed prefix groups against the limit.
     raw_count = sum(1 for it in items if not isinstance(it, MemoryPrefix))
-    has_more = raw_count == limit
+    has_more = raw_count == page_limit
     return ListResponse[Memory | MemoryPrefix](data=items, has_more=has_more)
 
 
@@ -273,19 +308,51 @@ async def list_versions(
     store_id: str,
     pool: PoolDep,
     account_id: AccountIdDep,
+    cursor: str | None = None,
     memory_id: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    include_content: bool = False,
+    limit: Annotated[int | None, Query(ge=1, le=200)] = None,
 ) -> ListResponse[MemoryVersion]:
-    """List memory versions in a store, newest first.
+    """List memory versions in a store, newest first (cursor-paginated).
 
     Optional ``memory_id`` filters to a single memory's version history.
     Without the filter, returns versions across all memories in the store
-    (useful for audit). No cursor pagination; bumps default limit to 100.
+    (useful for audit). ``include_content=true`` inlines each version's
+    content snapshot (redacted versions stay null) — used by ``aios
+    export`` to capture full history. First page: filters + ``?limit=``;
+    subsequent pages: ``?cursor=<next_cursor>``.
     """
-    items = await service.list_versions(
-        pool, store_id, memory_id=memory_id, limit=limit, account_id=account_id
+    st = page_cursor(
+        cursor,
+        {
+            "memory_id": memory_id,
+            "include_content": include_content or None,
+            "limit": limit,
+        },
     )
-    return ListResponse[MemoryVersion](data=items)
+    before_seq: int | None = None
+    if st is not None:
+        memory_id = st.filters.get("memory_id")
+        include_content = bool(st.filters.get("include_content"))
+        page_limit = st.limit
+        before_seq = int(st.cursor)
+    else:
+        page_limit = limit if limit is not None else 100
+    items = await service.list_versions(
+        pool,
+        store_id,
+        memory_id=memory_id,
+        limit=page_limit + 1,
+        before_seq=before_seq,
+        include_content=include_content,
+        account_id=account_id,
+    )
+    return ListResponse[MemoryVersion].paginate(
+        items,
+        page_limit,
+        cursor=lambda x: x.seq,
+        filters={"memory_id": memory_id, "include_content": include_content or None},
+    )
 
 
 @router.get("/{store_id}/memory-versions/{version_id}", operation_id="get_memory_version")
