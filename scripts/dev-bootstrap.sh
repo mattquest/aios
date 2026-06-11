@@ -164,6 +164,20 @@ if needs_gen "$(env_get AIOS_VAULT_KEY)"; then
   env_set AIOS_VAULT_KEY "$(openssl rand -base64 32)"
 fi
 
+# Postgres password: random on a FRESH stack only. The postgres image bakes
+# the password into the data volume at first init — generating a new one
+# against an existing volume would just break connections.
+pgdata_volume="$(basename "$REPO_ROOT" | tr '[:upper:]' '[:lower:]')_pgdata"
+if needs_gen "$(env_get POSTGRES_PASSWORD)"; then
+  if docker volume inspect "$pgdata_volume" >/dev/null 2>&1; then
+    say "existing pgdata volume — keeping default postgres password (run --reset for a fresh stack with a random one)"
+    env_set POSTGRES_PASSWORD "aios"
+  else
+    say "generating POSTGRES_PASSWORD (openssl rand -hex 24)"
+    env_set POSTGRES_PASSWORD "$(openssl rand -hex 24)"
+  fi
+fi
+
 # Workspace dir must exist before docker bind-mount sees it (Docker would
 # otherwise auto-create it as root-owned, which then breaks rm in dev).
 # Resolve to absolute and persist back to .env: compose bind-mounts use

@@ -21,9 +21,12 @@ services:
     # postgres:18 changed the in-image data layout from /var/lib/postgresql/data
     # to /var/lib/postgresql/<major>, which would break existing volumes.
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: aios
-      POSTGRES_PASSWORD: aios
+      # Generated into .env by scripts/dev-bootstrap.sh on first init;
+      # 'aios' fallback only kicks in for pre-existing dev volumes.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aios}
       POSTGRES_DB: aios
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aios -d aios"]
@@ -35,8 +38,11 @@ services:
     # Host-side 5433 (default) leaves 5432 free for an OS-installed
     # postgres; lean mode dials this port via .env's AIOS_DB_URL.
     # Override POSTGRES_HOST_PORT for parallel smoke stacks.
+    # Loopback-bound by default: Docker port maps bypass ufw/firewalld,
+    # so an unprefixed map on a VPS exposes the database to the internet.
+    # Set POSTGRES_HOST_BIND=0.0.0.0 only behind a real firewall.
     ports:
-      - "${POSTGRES_HOST_PORT:-5433}:5432"
+      - "${POSTGRES_HOST_BIND:-127.0.0.1}:${POSTGRES_HOST_PORT:-5433}:5432"
 
   migrate:
     build:
@@ -50,14 +56,18 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      AIOS_API_KEY: ${AIOS_API_KEY:?AIOS_API_KEY required — run scripts/dev-bootstrap.sh}
+      # No AIOS_API_KEY here: auth keys are DB-minted — on a fresh database
+      # THIS service mints the root key and prints it (dev-bootstrap.sh
+      # captures it into .env). Requiring the key before migrate runs was
+      # a chicken-and-egg.
       AIOS_VAULT_KEY: ${AIOS_VAULT_KEY:?AIOS_VAULT_KEY required — run scripts/dev-bootstrap.sh}
-      AIOS_DB_URL: postgresql://aios:aios@postgres:5432/aios
+      AIOS_DB_URL: postgresql://aios:${POSTGRES_PASSWORD:-aios}@postgres:5432/aios
 
   api:
     build:
       context: .
       target: api
+    restart: unless-stopped
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -69,7 +79,9 @@ services:
     env_file:
       - .env
     environment:
-      AIOS_DB_URL: postgresql://aios:aios@postgres:5432/aios
+      AIOS_DB_URL: postgresql://aios:${POSTGRES_PASSWORD:-aios}@postgres:5432/aios
+      # 0.0.0.0 inside the container is required for the port map below;
+      # the HOST side of that map is loopback-bound by default.
       AIOS_API_HOST: 0.0.0.0
       AIOS_API_PORT: "8080"
       AIOS_WORKSPACE_ROOT: ${WORKSPACE_HOST_PATH:?WORKSPACE_HOST_PATH must be an absolute path — run scripts/dev-bootstrap.sh}
@@ -85,14 +97,18 @@ services:
       # ``os.rename`` falls back to ``shutil.copy2`` + unlink across
       # filesystems, and the unlink runs on the source side.
       - signal_state:/var/lib/aios/signal-data
+    # Loopback-bound by default (Docker port maps bypass ufw/firewalld).
+    # Remote access should go through a reverse proxy with TLS, a VPN
+    # (Tailscale), or an explicit AIOS_API_BIND=0.0.0.0 behind a firewall.
     ports:
-      - "${AIOS_API_PORT:-8080}:8080"
+      - "${AIOS_API_BIND:-127.0.0.1}:${AIOS_API_PORT:-8080}:8080"
     # Healthcheck inherited from Dockerfile (curl http://127.0.0.1:8080/health).
 
   worker:
     build:
       context: .
       target: worker
+    restart: unless-stopped
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -100,7 +116,7 @@ services:
     env_file:
       - .env
     environment:
-      AIOS_DB_URL: postgresql://aios:aios@postgres:5432/aios
+      AIOS_DB_URL: postgresql://aios:${POSTGRES_PASSWORD:-aios}@postgres:5432/aios
       AIOS_WORKSPACE_ROOT: ${WORKSPACE_HOST_PATH:?WORKSPACE_HOST_PATH must be an absolute path — run scripts/dev-bootstrap.sh}
     volumes:
       - "${WORKSPACE_HOST_PATH:?WORKSPACE_HOST_PATH must be an absolute path — run scripts/dev-bootstrap.sh}:${WORKSPACE_HOST_PATH:?WORKSPACE_HOST_PATH must be an absolute path — run scripts/dev-bootstrap.sh}"
@@ -112,6 +128,7 @@ services:
     build:
       context: .
       dockerfile: connectors/echo-http/Dockerfile
+    restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
@@ -135,6 +152,7 @@ services:
     build:
       context: .
       dockerfile: connectors/telegram/Dockerfile
+    restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
@@ -153,6 +171,7 @@ services:
     build:
       context: .
       dockerfile: connectors/signal/Dockerfile
+    restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
