@@ -162,7 +162,11 @@ export AIOS_URL=http://localhost:8090
 
 uv run aios status   # reachability + auth check — fix this first if it fails
 
-uv run aios envs create --data '{"name": "default"}'
+# Sandbox egress: deny-all except package registries. The web_fetch /
+# web_search tools run worker-side, so this doesn't limit web research.
+# Drop the config for unrestricted networking, or add "allowed_hosts".
+uv run aios envs create --data '{"name": "default", "config": {"networking":
+  {"type": "limited", "allow_package_managers": true}}}'
 uv run aios agents create --stdin <<'EOF'
 {
   "name": "assistant",
@@ -196,6 +200,14 @@ uv run aios assistant init --name Aria --user-name Sam \
 ```
 
 The generated prompt only claims what's actually configured — web tools appear only if `AIOS_TAVILY_API_KEY` is set, and the channel section matches the channel you chose (`--channel none` skips channel setup). Re-running is safe: the memory store and session are reused and the agent is updated in place. For Telegram delivery the connector container must be running — see [connectors/telegram/README.md](connectors/telegram/README.md).
+
+If no environment exists yet, the wizard creates one with **limited networking**: the sandbox can reach package registries (pip/npm/apt/cargo/gem/go) but nothing else — web research goes through the worker-side `web_search`/`web_fetch` tools, and channel delivery runs in the connector container, so neither needs sandbox egress. If it reuses an existing environment with unrestricted networking, it warns and prints the command to restrict it. To let the assistant call specific APIs directly from bash, add hosts to the allowlist:
+
+```bash
+aios envs update <env_id> --data '{"config": {"networking":
+  {"type": "limited", "allow_package_managers": true,
+   "allowed_hosts": ["api.example.com"]}}}'
+```
 
 ## Run the full stack with Docker Compose
 

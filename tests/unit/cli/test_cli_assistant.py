@@ -134,6 +134,20 @@ def test_fresh_provision_channel_none(api):
     tool_types = {t["type"] for t in agent_body["tools"]}
     assert "web_search" not in tool_types
 
+    # Fresh environments default to deny-all networking with package
+    # registries allowed — the assistant's web tools run worker-side.
+    env_body = api.sent("POST", "/v1/environments")[0].body
+    assert env_body == {
+        "name": "default",
+        "config": {
+            "networking": {
+                "type": "limited",
+                "allowed_hosts": [],
+                "allow_package_managers": True,
+            }
+        },
+    }
+
     session_body = api.sent("POST", "/v1/sessions")[0].body
     assert session_body["agent_id"] == "ag_1"
     assert session_body["environment_id"] == "env_1"
@@ -225,6 +239,43 @@ def test_telegram_unverifiable_token_warns_and_continues(api, monkeypatch):
     assert "could not verify" in result.output
     # Falls back to the token-prefix bot id.
     assert api.sent("POST", "/v1/connections")[0].body["external_account_id"] == "12345"
+
+
+# ── environment networking ─────────────────────────────────────────────
+
+
+def _route_existing_env(api: FakeApi, config: dict[str, Any] | None) -> None:
+    api.set(
+        "GET",
+        "/v1/environments",
+        {
+            "data": [{"id": "env_1", "name": "default", "archived_at": None, "config": config}],
+            "has_more": False,
+            "next_cursor": None,
+        },
+    )
+
+
+def test_reused_unrestricted_env_warns(api):
+    route_fresh(api)
+    _route_existing_env(api, {"networking": None})
+    result = runner.invoke(app, [*INIT_FLAGS, "--channel", "none"])
+    assert result.exit_code == 0, result.output
+    assert not api.sent("POST", "/v1/environments")
+    assert "unrestricted outbound" in result.output
+    assert "aios envs update env_1" in result.output
+
+
+def test_reused_limited_env_does_not_warn(api):
+    route_fresh(api)
+    _route_existing_env(
+        api,
+        {"networking": {"type": "limited", "allowed_hosts": [], "allow_package_managers": True}},
+    )
+    result = runner.invoke(app, [*INIT_FLAGS, "--channel", "none"])
+    assert result.exit_code == 0, result.output
+    assert not api.sent("POST", "/v1/environments")
+    assert "unrestricted outbound" not in result.output
 
 
 # ── idempotent re-run ──────────────────────────────────────────────────

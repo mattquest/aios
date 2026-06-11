@@ -53,6 +53,28 @@ _DEFAULT_MODEL = "anthropic/claude-sonnet-4-6"
 # A Telegram bot token is "<numeric bot id>:<secret>" (per BotFather).
 _BOT_TOKEN_RE = re.compile(r"^(\d+):\S+$")
 
+# Starter network policy for the environment the wizard creates: deny-all
+# outbound from the sandbox, with two carve-outs the assistant actually
+# needs:
+#   - allow_package_managers: pip/npm/apt/cargo/gem/go registries (the
+#     fixed host list in aios.sandbox.setup.PACKAGE_REGISTRY_HOSTS), so
+#     the model can install tooling in its sandbox.
+#   - allowed_hosts: empty to start — the assistant's web research runs
+#     through the worker-side web_search/web_fetch tools (Tavily), and
+#     channel delivery runs in the connector container, so neither needs
+#     sandbox egress. The worker-side tool broker and git proxy ports are
+#     always allowed by the lockdown itself.
+# Widen per deployment when the assistant needs direct API access from
+# bash, e.g.:
+#   aios envs update <env_id> --data '{"config": {"networking":
+#     {"type": "limited", "allow_package_managers": true,
+#      "allowed_hosts": ["api.example.com"]}}}'
+_STARTER_NETWORKING: dict[str, Any] = {
+    "type": "limited",
+    "allowed_hosts": [],
+    "allow_package_managers": True,
+}
+
 
 def _default_timezone() -> str:
     """Best-effort local IANA zone from /etc/localtime; UTC otherwise."""
@@ -364,16 +386,30 @@ def _provision(
         agent = updated
     ids["agent"] = agent["id"]
 
-    # 4. environment — reuse 'default', else the first one, else create.
+    # 4. environment — reuse 'default', else the first one, else create
+    # one with the starter network policy (_STARTER_NETWORKING).
     envs = fetch_all(client, "/v1/environments")["data"]
     env = _find_active(envs, "name", "default")
     if env is None:
         env = next((e for e in envs if not e.get("archived_at")), None)
     if env is None:
-        env = client.request("POST", "/v1/environments", json_body={"name": "default"})
-        _say(f"create env     {env['id']} (default)")
+        env = client.request(
+            "POST",
+            "/v1/environments",
+            json_body={"name": "default", "config": {"networking": _STARTER_NETWORKING}},
+        )
+        _say(f"create env     {env['id']} (default, limited networking)")
     else:
         _say(f"use env        {env['id']} ({env.get('name')})")
+        networking = (env.get("config") or {}).get("networking") or {}
+        if networking.get("type") != "limited":
+            print_note(
+                f"warning: environment {env['id']} allows unrestricted outbound "
+                "network from the sandbox. To restrict it to package registries: "
+                f"aios envs update {env['id']} --data "
+                '\'{"config": {"networking": {"type": "limited", '
+                '"allow_package_managers": true}}}\''
+            )
     ids["env"] = env["id"]
 
     # 5. the session — created once, never recreated (it is the
