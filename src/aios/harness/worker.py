@@ -9,7 +9,8 @@
 5. Creates the SandboxRegistry, TaskRegistry, and McpSessionPool
 6. Stashes globals on :mod:`aios.harness.runtime`
 7. Opens the procrastinate connector
-8. Sweeps orphan attachments, reaps stalled jobs, wakes sessions needing inference
+8. Sweeps orphan attachments and workspaces, reaps stalled jobs, wakes
+   sessions needing inference
 9. Reaps orphaned sandbox containers
 10. Starts the container idle-TTL reaper, periodic sweep, interrupt listener, and liveness heartbeat
 11. Starts ``app.run_worker_async`` which blocks until SIGTERM/SIGINT
@@ -25,6 +26,7 @@ import asyncio
 import contextlib
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,7 @@ from aios.harness.sweep import (
     wake_sessions_needing_inference,
 )
 from aios.harness.task_registry import TaskRegistry
+from aios.harness.workspace_gc import sweep_orphan_workspaces
 from aios.logging import configure_logging, get_logger
 from aios.mcp.pool import McpSessionPool
 from aios.sandbox.backends.docker import DockerBackend
@@ -58,6 +61,22 @@ from aios.sandbox.tool_broker import ToolBroker
 # is a historical magic value, preserved verbatim so a rolling deploy
 # computes the same lock number across old and new workers.
 _WORKER_SINGLETON_LOCK_KEY_TEXT = "aios_worker_connector_supervisor"
+
+# Periodic-sweep cadence. Fast passes run every tick bounded to events newer
+# than the last clean pass's DB-clock watermark minus a safety margin (the
+# margin absorbs ``created_at`` being frozen at transaction start: an append
+# whose transaction was still uncommitted when a pass took its snapshot
+# carries a slightly-older timestamp, and the margin keeps it inside the
+# next pass's window — append transactions hold the session row lock for
+# milliseconds, so five minutes is ~10^4x headroom). Every Nth tick runs a
+# full (unbounded) pass — identical to the pre-watermark behavior — as the
+# backstop for states that produce no fresh event: a startup ghost repair
+# whose ``append_tool_result`` failed, or an in-flight tool task that
+# vanished without a result long after its dispatching assistant message
+# left the window. Those double-fault cases degrade from 30s to ≤1h
+# detection latency; nothing is ever skipped permanently.
+_FULL_SWEEP_EVERY_TICKS = 120  # one full pass per hour at the 30s interval
+_SWEEP_WATERMARK_MARGIN = timedelta(minutes=5)
 
 # The worker touches ``settings.worker_heartbeat_file`` periodically to
 # signal liveness; the Dockerfile HEALTHCHECK reads its mtime (pinned to
@@ -147,6 +166,13 @@ async def worker_main() -> None:
         if deleted_attachments:
             log.info("worker.reaped_orphan_attachments", count=deleted_attachments)
 
+        # Remove session-keyed workspace dirs whose session is gone (or
+        # archived past retention). Same once-at-startup slot as the
+        # attachment sweep; see workspace_gc.py for the safety rules.
+        removed_workspaces = await sweep_orphan_workspaces(pool)
+        if removed_workspaces:
+            log.info("worker.reaped_orphan_workspaces", count=removed_workspaces)
+
         log.info(
             "worker.startup",
             worker_id=runtime.worker_id,
@@ -159,7 +185,12 @@ async def worker_main() -> None:
         #      Must run BEFORE the wake sweep so freshly-unblocked sessions
         #      get re-enqueued in the same pass.
         #   2. Repair tool-call ghosts and wake sessions needing inference.
+        #      This pass is UNBOUNDED — it anchors the recency watermark the
+        #      periodic fast passes start from (captured on the DB clock
+        #      before the pass so nothing falls between them).
         await reap_stalled_jobs(procrastinate_app.job_manager)
+        async with pool.acquire() as conn:
+            sweep_watermark: datetime = await conn.fetchval("SELECT now()")
         sweep = await wake_sessions_needing_inference(pool, task_registry)
         if sweep.woken_sessions or sweep.repaired_ghosts:
             log.info(
@@ -182,9 +213,16 @@ async def worker_main() -> None:
         sandbox_registry.start_reaper(idle_timeout=settings.container_idle_timeout_seconds)
         mcp_session_pool.start_reaper(idle_timeout=settings.mcp_pool_idle_timeout_seconds)
 
-        # Start periodic sweep (every 30s).
+        # Start periodic sweep (every 30s; recency-bounded fast passes with
+        # hourly full passes — see _periodic_sweep).
         sweep_task = asyncio.create_task(
-            _periodic_sweep(pool, task_registry, procrastinate_app.job_manager, interval=30),
+            _periodic_sweep(
+                pool,
+                task_registry,
+                procrastinate_app.job_manager,
+                interval=30,
+                initial_watermark=sweep_watermark,
+            ),
             name="periodic_sweep",
         )
 
@@ -369,16 +407,37 @@ async def _periodic_sweep(
     job_manager: Any,
     *,
     interval: int = 30,
+    initial_watermark: datetime | None = None,
 ) -> None:
-    """Background task: run the sweep periodically."""
+    """Background task: run the sweep periodically.
+
+    Alternates recency-bounded fast passes with full passes (see the
+    cadence constants above). ``initial_watermark`` is the DB-clock
+    instant captured before the startup sweep; the watermark advances
+    only when a pass completes without raising, so a failed pass widens
+    the next window to cover the gap instead of skipping it.
+    """
     log = get_logger("aios.worker.sweep")
+    watermark = initial_watermark
+    tick = 0
     while True:
         await asyncio.sleep(interval)
+        tick += 1
         try:
             # Reap stalled jobs first so any unblocked sessions get re-enqueued
             # in the same tick (mirrors worker_main's startup sequence).
             await reap_stalled_jobs(job_manager)
-            sweep = await wake_sessions_needing_inference(pool, task_registry)
+            if watermark is None or tick % _FULL_SWEEP_EVERY_TICKS == 0:
+                since = None
+            else:
+                since = watermark - _SWEEP_WATERMARK_MARGIN
+            # Capture the next watermark BEFORE the pass: events committing
+            # while the pass runs may be invisible to its snapshot, and the
+            # pre-pass instant keeps them inside the next window.
+            async with pool.acquire() as conn:
+                pass_started_at: datetime = await conn.fetchval("SELECT now()")
+            sweep = await wake_sessions_needing_inference(pool, task_registry, since=since)
+            watermark = pass_started_at
             if sweep.woken_sessions or sweep.repaired_ghosts:
                 log.info(
                     "periodic_sweep.woken",

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
@@ -63,6 +64,14 @@ class SweepResult:
 # re-predicated to match in migration 0023. The two MAX(reacting_to)
 # queries use a CTE to hoist the aggregation out of the outer scan —
 # see PR #145 for the ~800-900x speedup that revealed.
+#
+# ``{recency_clause}`` / ``{cte_recency_clause}`` bound the two scans whose
+# cost otherwise grows with total event-log size (every assistant message
+# with tool_calls ever / every non-assistant message ever). The periodic
+# sweep fills them with ``created_at >= $N`` (DB clock) for its fast
+# passes; the startup sweep and the periodic full passes leave them empty.
+# Why a recency bound is safe there — and only there — is argued at the
+# ``since`` parameter docs on :func:`wake_sessions_needing_inference`.
 
 
 GHOST_ASST_SQL = """
@@ -74,8 +83,14 @@ GHOST_ASST_SQL = """
        AND e.role = 'assistant'
        AND jsonb_array_length(COALESCE(NULLIF(e.data->'tool_calls', 'null'::jsonb), '[]'::jsonb)) > 0
        {scope_clause}
+       {recency_clause}
 """
 
+# Probe by exact (session, tool_call_id) sets instead of fetching every
+# confirmed-allow lifecycle row of the candidate sessions: a long-lived
+# session would otherwise pay O(its whole event log) here on every sweep
+# in which it has a candidate tool call. Index-only via
+# ``events_tool_confirmed_allow_idx`` (migration 0066).
 GHOST_LIFECYCLE_SQL = """
     SELECT e.session_id, e.data->>'tool_call_id' AS tool_call_id
       FROM events e
@@ -83,6 +98,21 @@ GHOST_LIFECYCLE_SQL = """
        AND e.kind = 'lifecycle'
        AND e.data->>'event' = 'tool_confirmed'
        AND e.data->>'result' = 'allow'
+       AND e.data->>'tool_call_id' = ANY($2::text[])
+"""
+
+# Same probe shape for tool results: membership of specific tool_call_ids
+# is all ghost detection needs, and ``events_tool_result_idx`` serves the
+# (session_id, tool_call_id) probes without reading the session's full
+# result history. ``ALL_RESULT_ROWS_SQL`` below remains for the batch
+# filter, which genuinely needs the full per-session result set.
+RESULT_ROWS_FOR_TCIDS_SQL = """
+    SELECT e.session_id, e.data->>'tool_call_id' AS tool_call_id
+      FROM events e
+     WHERE e.session_id = ANY($1::text[])
+       AND e.kind = 'message'
+       AND e.role = 'tool'
+       AND e.data->>'tool_call_id' = ANY($2::text[])
 """
 
 # Dispatch-marker spans: pre-invoke ``tool_execute_start`` events keyed by
@@ -103,6 +133,16 @@ GHOST_SPAN_START_SQL = """
        AND e.data->>'tool_call_id' = ANY($2::text[])
 """
 
+# Recency-bounding note: when ``{recency_clause}``/``{cte_recency_clause}``
+# are set, BOTH the outer scan and the CTE carry the same bound. That is
+# correct for the in-window events the outer scan returns: an assistant
+# message whose ``reacting_to`` covers event ``e`` saw ``e`` in its context
+# and was therefore appended (and timestamped) after ``e`` — so for every
+# in-window ``e``, the assistant message that would exclude it is also
+# in-window. Excluding out-of-window assistant rows from the CTE can only
+# produce false *positives* (extra candidates), never false negatives, and
+# spurious wakes are absorbed by the per-session entry guard in
+# ``loop._run_session_step_body`` (scoped, unbounded, exact).
 CANDIDATE_ROWS_SQL = """
     WITH session_max_reacting AS (
         SELECT session_id,
@@ -110,6 +150,7 @@ CANDIDATE_ROWS_SQL = """
           FROM events
          WHERE kind = 'message' AND role = 'assistant'
          {cte_scope_clause}
+         {cte_recency_clause}
          GROUP BY session_id
     )
     SELECT DISTINCT e.session_id
@@ -121,8 +162,17 @@ CANDIDATE_ROWS_SQL = """
        AND e.role <> 'assistant'
        AND (smr.max_reacting IS NULL OR e.seq > smr.max_reacting)
        {scope_clause}
+       {recency_clause}
 """
 
+# Deliberately NOT recency-bounded: a confirmed-but-undispatched tool call
+# produces no further events while it waits, so an old ``tool_confirmed
+# allow`` row may be the only trace of work the sweep must pick up (case
+# (c) below). Cheap anyway — the whole query rides the tiny partial index
+# ``events_tool_confirmed_allow_idx`` (migration 0066; before it this was a
+# full seq scan of ``events`` every pass, since no index covered
+# ``kind = 'lifecycle'`` at all), and the NOT EXISTS probes
+# ``events_tool_result_idx``.
 CONFIRMED_ROWS_SQL = """
     SELECT DISTINCT lc.session_id
       FROM events lc
@@ -159,6 +209,12 @@ UNREACTED_ROWS_SQL = """
        AND e.seq > COALESCE(smr.max_reacting, 0)
 """
 
+# The batch-filter trio below (UNREACTED / ALL_RESULT / ALL_ASST) is scoped
+# to candidate sessions but deliberately NOT recency-bounded within them:
+# the assistant message that dispatched a just-completed batch can be
+# arbitrarily old (long-running tool), and a bound that missed it would
+# silently drop a genuinely-ready session from the wake set — a false
+# negative, unlike the candidate query's tolerable false positives.
 ALL_RESULT_ROWS_SQL = """
     SELECT e.session_id, e.data->>'tool_call_id' AS tool_call_id
       FROM events e
@@ -188,8 +244,13 @@ ALL_ASST_ROWS_SQL = """
 # Shape: two ``MAX(seq)``-per-session CTEs joined — the same hoisted-aggregation
 # pattern as ``session_max_reacting`` above, so no correlated SubPlan re-scans
 # ``events`` (the #140 pathology). The error CTE is backed by the partial index
-# ``events_turn_error_idx`` (migration 0062); the user CTE reuses
-# ``events_session_message_seq_idx`` (migration 0001).
+# ``events_turn_error_idx`` (migration 0062). The user CTE joins ``err_max``
+# so it aggregates only the sessions the outer join will actually consult —
+# without the join it computed ``MAX(seq)`` over every user message of every
+# session on every pass — and is backed by ``events_session_user_seq_idx``
+# (migration 0066). Not recency-bounded: this derives current state (which
+# sessions are parked-errored), not a transition, so a window would compute
+# the wrong set.
 ERRORED_SESSIONS_SQL = """
     WITH err_max AS (
         SELECT session_id, MAX(seq) AS err_seq
@@ -199,11 +260,11 @@ ERRORED_SESSIONS_SQL = """
          GROUP BY session_id
     ),
     user_max AS (
-        SELECT session_id, MAX(seq) AS user_seq
-          FROM events
-         WHERE kind = 'message' AND role = 'user'
-         {scope_clause}
-         GROUP BY session_id
+        SELECT e.session_id, MAX(e.seq) AS user_seq
+          FROM events e
+          JOIN err_max em ON em.session_id = e.session_id
+         WHERE e.kind = 'message' AND e.role = 'user'
+         GROUP BY e.session_id
     )
     SELECT em.session_id
       FROM err_max em
@@ -220,6 +281,7 @@ async def find_and_repair_ghosts(
     task_registry: TaskRegistry,
     *,
     session_id: str | None = None,
+    since: datetime | None = None,
 ) -> list[tuple[str, str]]:
     """Find ghost tool calls and append synthetic error results.
 
@@ -231,24 +293,33 @@ async def find_and_repair_ghosts(
       custom tool or an unconfirmed ``always_ask`` tool still waiting
       for client action).
 
+    ``since`` bounds the assistant-message scan to events created at or
+    after the given DB-clock instant. See
+    :func:`wake_sessions_needing_inference` for when that is safe.
+
     Returns a list of ``(session_id, tool_call_id)`` pairs that were
     repaired.
     """
     in_flight = task_registry.all_in_flight_tool_call_ids()
 
-    scope_clause = "AND e.session_id = $1" if session_id else ""
-    scope_params: list[Any] = [session_id] if session_id else []
+    params: list[Any] = []
+    scope_clause = ""
+    if session_id is not None:
+        params.append(session_id)
+        scope_clause = f"AND e.session_id = ${len(params)}"
+    recency_clause = ""
+    if since is not None:
+        params.append(since)
+        recency_clause = f"AND e.created_at >= ${len(params)}"
 
     async with pool.acquire() as conn:
         asst_rows = await conn.fetch(
-            GHOST_ASST_SQL.format(scope_clause=scope_clause),
-            *scope_params,
+            GHOST_ASST_SQL.format(scope_clause=scope_clause, recency_clause=recency_clause),
+            *params,
         )
 
         if not asst_rows:
             return []
-
-        session_ids = list({r["session_id"] for r in asst_rows})
 
         # Skip errored sessions: their dispatched-but-unresolved tool calls are
         # part of the terminal landing pad and stay unreaped until a user
@@ -258,37 +329,52 @@ async def find_and_repair_ghosts(
             asst_rows = [r for r in asst_rows if r["session_id"] not in errored]
             if not asst_rows:
                 return []
-            session_ids = [s for s in session_ids if s not in errored]
 
-        result_rows = await conn.fetch(ALL_RESULT_ROWS_SQL, session_ids)
+        # Collect every (session, tool_call) the scanned assistant messages
+        # carry, then probe results for exactly those ids — never the
+        # sessions' full result history.
+        calls: list[tuple[str, str, str]] = []  # (session_id, tool_call_id, tool_name)
+        for row in asst_rows:
+            sid = row["session_id"]
+            data = parse_jsonb(row["data"])
+            for tc in data.get("tool_calls") or []:
+                tcid = tc.get("id")
+                if not tcid:
+                    continue
+                name = (tc.get("function") or {}).get("name", "")
+                calls.append((sid, tcid, name))
+
+        if not calls:
+            return []
+
+        call_sids = list({sid for sid, _, _ in calls})
+        call_tcids = list({tcid for _, tcid, _ in calls})
+        result_rows = await conn.fetch(RESULT_ROWS_FOR_TCIDS_SQL, call_sids, call_tcids)
         results_by_session: dict[str, set[str]] = {}
         for r in result_rows:
             results_by_session.setdefault(r["session_id"], set()).add(r["tool_call_id"])
 
-        lifecycle_rows = await conn.fetch(GHOST_LIFECYCLE_SQL, session_ids)
+        # Candidate ghosts: no result, no in-flight task. We don't yet know
+        # their dispatch status — that requires agent config.
+        candidates: list[tuple[str, str, str]] = []
+        for sid, tcid, name in calls:
+            existing_results = results_by_session.get(sid, set())
+            session_in_flight = in_flight.get(sid, set())
+            if tcid in existing_results or tcid in session_in_flight:
+                continue
+            candidates.append((sid, tcid, name))
+
+        if not candidates:
+            return []
+
+        lifecycle_rows = await conn.fetch(
+            GHOST_LIFECYCLE_SQL,
+            list({sid for sid, _, _ in candidates}),
+            list({tcid for _, tcid, _ in candidates}),
+        )
         confirmed_by_session: dict[str, set[str]] = {}
         for r in lifecycle_rows:
             confirmed_by_session.setdefault(r["session_id"], set()).add(r["tool_call_id"])
-
-    # First pass: find candidate ghosts (no result, no in-flight task).
-    # We don't yet know their dispatch status — that requires agent config.
-    candidates: list[tuple[str, str, str]] = []  # (session_id, tool_call_id, tool_name)
-
-    for row in asst_rows:
-        sid = row["session_id"]
-        data = parse_jsonb(row["data"])
-        existing_results = results_by_session.get(sid, set())
-        session_in_flight = in_flight.get(sid, set())
-
-        for tc in data.get("tool_calls") or []:
-            tcid = tc.get("id")
-            if not tcid or tcid in existing_results or tcid in session_in_flight:
-                continue
-            name = (tc.get("function") or {}).get("name", "")
-            candidates.append((sid, tcid, name))
-
-    if not candidates:
-        return []
 
     # Second pass: load agent config only for sessions with candidates,
     # then filter to actually-dispatched tools.
@@ -473,6 +559,7 @@ async def find_sessions_needing_inference(
     task_registry: TaskRegistry,
     *,
     session_id: str | None = None,
+    since: datetime | None = None,
 ) -> set[str]:
     """Return session IDs that need an inference step.
 
@@ -489,6 +576,10 @@ async def find_sessions_needing_inference(
     Sessions from (a)/(b) are filtered: if the only unreacted events are
     tool results from a batch with in-flight tasks, the session is not
     yet ready. Case (c) sessions bypass this filter.
+
+    ``since`` bounds the (a)/(b) candidate scan to events created at or
+    after the given DB-clock instant; case (c) is never bounded. See
+    :func:`wake_sessions_needing_inference` for when that is safe.
     """
     scope_clause = "AND s.id = $1" if session_id else ""
     # CANDIDATE_ROWS_SQL's CTE aggregates per-session; when scoped, prune it
@@ -497,10 +588,22 @@ async def find_sessions_needing_inference(
     cte_scope_clause = "AND session_id = $1" if session_id else ""
     scope_params: list[Any] = [session_id] if session_id else []
 
+    candidate_params = list(scope_params)
+    recency_clause = cte_recency_clause = ""
+    if since is not None:
+        candidate_params.append(since)
+        recency_clause = f"AND e.created_at >= ${len(candidate_params)}"
+        cte_recency_clause = f"AND created_at >= ${len(candidate_params)}"
+
     async with pool.acquire() as conn:
         candidate_rows = await conn.fetch(
-            CANDIDATE_ROWS_SQL.format(scope_clause=scope_clause, cte_scope_clause=cte_scope_clause),
-            *scope_params,
+            CANDIDATE_ROWS_SQL.format(
+                scope_clause=scope_clause,
+                cte_scope_clause=cte_scope_clause,
+                recency_clause=recency_clause,
+                cte_recency_clause=cte_recency_clause,
+            ),
+            *candidate_params,
         )
 
         candidates = {r["session_id"] for r in candidate_rows}
@@ -698,6 +801,7 @@ async def wake_sessions_needing_inference(
     task_registry: TaskRegistry,
     *,
     session_id: str | None = None,
+    since: datetime | None = None,
 ) -> SweepResult:
     """The main sweep function.
 
@@ -705,12 +809,34 @@ async def wake_sessions_needing_inference(
     2. Finds sessions needing inference.
     3. Defers procrastinate wakes for those sessions.
 
+    ``since`` (DB clock) bounds the two event scans whose cost otherwise
+    grows with total event-log size — the ghost assistant-message scan
+    and the unreacted-candidate scan. Bounding is safe because every
+    transition into "needs inference / has a repairable ghost" is
+    accompanied by an event appended to that session at transition time
+    (user message, tool result, tool_confirmed, ghost-repair result),
+    and the assistant message behind any tool call the *running* worker
+    dispatched was appended during the current worker's lifetime (the
+    advisory lock in worker.py enforces a single worker): a bounded pass
+    whose window covers everything since the last clean pass therefore
+    sees every trigger a full pass would. The caller MUST anchor that
+    guarantee with unbounded passes — at startup, and periodically as a
+    backstop for the no-fresh-event pathologies (a repair append that
+    failed and was never retried, clock-margin edge cases). See
+    ``worker._periodic_sweep`` for the cadence.
+
+    Per-session scoped sweeps (``session_id=...``) should not pass
+    ``since``: the entry guard in ``loop._run_session_step_body`` relies
+    on their exact, unbounded semantics.
+
     Returns a :class:`SweepResult` carrying the repaired-ghost count and
     the number of procrastinate wakes deferred, so the tail-site
     ``sweep_end`` span can stamp both without unrolling the composition.
     """
-    repaired = await find_and_repair_ghosts(pool, task_registry, session_id=session_id)
-    woken = await find_sessions_needing_inference(pool, task_registry, session_id=session_id)
+    repaired = await find_and_repair_ghosts(pool, task_registry, session_id=session_id, since=since)
+    woken = await find_sessions_needing_inference(
+        pool, task_registry, session_id=session_id, since=since
+    )
     # Per-session try/except: a transient failure on one session must
     # not strand the rest of the cross-session batch.  account_id is
     # loaded individually because the cross-session sweeper has none

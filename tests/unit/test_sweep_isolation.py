@@ -67,7 +67,7 @@ async def test_ghost_repair_failure_does_not_abort_batch(monkeypatch: Any) -> No
         {"session_id": "sess_b", "tools": "[]"},
     ]
     # find_and_repair_ghosts issues six ``conn.fetch`` calls in order:
-    # GHOST_ASST_SQL, ERRORED_SESSIONS_SQL, ALL_RESULT_ROWS_SQL,
+    # GHOST_ASST_SQL, ERRORED_SESSIONS_SQL, RESULT_ROWS_FOR_TCIDS_SQL,
     # GHOST_LIFECYCLE_SQL, agents, GHOST_SPAN_START_SQL.  The empty errored
     # and span results mean no session is parked-errored and both ghosts hit
     # the "never started" branch of the recovery synthesis (#685) — which
@@ -133,7 +133,7 @@ async def test_ghost_repair_branch_may_have_completed(monkeypatch: Any) -> None:
         {"session_id": "sess_a", "tool_call_id": "tc_a"},
     ]
     # find_and_repair_ghosts now issues six ``conn.fetch`` calls in order:
-    # GHOST_ASST_SQL, ERRORED_SESSIONS_SQL, ALL_RESULT_ROWS_SQL,
+    # GHOST_ASST_SQL, ERRORED_SESSIONS_SQL, RESULT_ROWS_FOR_TCIDS_SQL,
     # GHOST_LIFECYCLE_SQL, agents, GHOST_SPAN_START_SQL.
     conn = MagicMock()
     conn.fetch = AsyncMock(side_effect=[ghost_rows, [], [], lifecycle_rows, agent_rows, span_rows])
@@ -179,8 +179,9 @@ async def test_ghost_repair_branch_did_not_run(monkeypatch: Any) -> None:
     ]
     # NO span for tc_a → routes the synthesis to the "did not run" branch.
     span_rows: list[dict[str, Any]] = []
-    # Six fetches: GHOST_ASST_SQL, ERRORED_SESSIONS_SQL, ALL_RESULT_ROWS_SQL,
-    # GHOST_LIFECYCLE_SQL, agents, GHOST_SPAN_START_SQL.
+    # Six fetches: GHOST_ASST_SQL, ERRORED_SESSIONS_SQL,
+    # RESULT_ROWS_FOR_TCIDS_SQL, GHOST_LIFECYCLE_SQL, agents,
+    # GHOST_SPAN_START_SQL.
     conn = MagicMock()
     conn.fetch = AsyncMock(side_effect=[ghost_rows, [], [], lifecycle_rows, agent_rows, span_rows])
     pool = fake_pool_yielding_conn(conn)

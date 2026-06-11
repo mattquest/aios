@@ -17,7 +17,7 @@ import json
 import math
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import EllipsisType
 from typing import Any, NamedTuple, NoReturn, cast
 
@@ -1275,6 +1275,33 @@ async def list_attachment_paths_for_sessions(
         if inline_path is not None:
             result[row["session_id"]].add(inline_path)
     return result
+
+
+async def list_sessions_for_workspace_gc(
+    conn: asyncpg.Connection[Any],
+    *,
+    archived_retention: timedelta,
+) -> list[tuple[str, str | None]]:
+    """Return ``(id, workspace_volume_path)`` for every session the
+    workspace GC must NOT touch: live sessions plus those archived more
+    recently than ``archived_retention``.
+
+    Unscoped by account on purpose — the GC is a worker-wide operator
+    sweep over the shared ``workspace_root``, like
+    :func:`list_attachment_paths_for_sessions`. The sessions table is
+    small (no event-log scan), so returning the full retained set keeps
+    the sweep to one round trip.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT id, workspace_volume_path
+          FROM sessions
+         WHERE archived_at IS NULL
+            OR archived_at > now() - $1::interval
+        """,
+        archived_retention,
+    )
+    return [(r["id"], r["workspace_volume_path"]) for r in rows]
 
 
 async def update_session(

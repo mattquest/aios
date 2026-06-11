@@ -31,12 +31,30 @@ import pytest
 from aios.db.queries import _SESSION_STATUS_EXPR
 from aios.harness.sweep import (
     CANDIDATE_ROWS_SQL,
+    CONFIRMED_ROWS_SQL,
     ERRORED_SESSIONS_SQL,
+    GHOST_ASST_SQL,
+    GHOST_LIFECYCLE_SQL,
     GHOST_SPAN_START_SQL,
     UNREACTED_ROWS_SQL,
 )
 from tests.conftest import needs_docker
 from tests.support import find_subplans_over_events
+
+# The unbounded shape of the candidate query (startup sweep / periodic
+# full pass) and the recency-bounded shape (periodic fast pass).
+_CANDIDATE_UNBOUNDED = CANDIDATE_ROWS_SQL.format(
+    scope_clause="", cte_scope_clause="", recency_clause="", cte_recency_clause=""
+)
+_CANDIDATE_BOUNDED = CANDIDATE_ROWS_SQL.format(
+    scope_clause="",
+    cte_scope_clause="",
+    recency_clause="AND e.created_at >= $1",
+    cte_recency_clause="AND created_at >= $1",
+)
+_GHOST_ASST_BOUNDED = GHOST_ASST_SQL.format(
+    scope_clause="", recency_clause="AND e.created_at >= $1"
+)
 
 pytestmark = pytest.mark.docker
 
@@ -265,14 +283,36 @@ class TestNoCorrelatedSubplanOverEvents:
     a correlated SubPlan. That shape was the N+1 pathology behind #140."""
 
     async def test_candidate_rows_is_not_n_plus_1(self, seeded_pool: asyncpg.Pool[Any]) -> None:
-        plan = await _explain(
-            seeded_pool, CANDIDATE_ROWS_SQL.format(scope_clause="", cte_scope_clause="")
-        )
+        plan = await _explain(seeded_pool, _CANDIDATE_UNBOUNDED)
         found = find_subplans_over_events(plan)
         assert not found, (
             f"N+1 regression in find_sessions_needing_inference candidate query: "
             f"{len(found)} correlated subplan(s) over events. "
             f"See PR #145 — this query must hoist MAX(reacting_to) via a CTE."
+        )
+
+    async def test_bounded_candidate_rows_is_not_n_plus_1(
+        self, seeded_pool: asyncpg.Pool[Any]
+    ) -> None:
+        """The recency-bounded fast-pass shape (periodic sweep) must keep
+        the same hoisted-CTE structure as the unbounded one."""
+        from datetime import UTC, datetime
+
+        plan = await _explain(seeded_pool, _CANDIDATE_BOUNDED, datetime.now(UTC))
+        found = find_subplans_over_events(plan)
+        assert not found, (
+            f"N+1 regression in the recency-bounded candidate query: "
+            f"{len(found)} correlated subplan(s) over events."
+        )
+
+    async def test_bounded_ghost_asst_is_not_n_plus_1(self, seeded_pool: asyncpg.Pool[Any]) -> None:
+        from datetime import UTC, datetime
+
+        plan = await _explain(seeded_pool, _GHOST_ASST_BOUNDED, datetime.now(UTC))
+        found = find_subplans_over_events(plan)
+        assert not found, (
+            f"N+1 regression in the recency-bounded ghost scan: "
+            f"{len(found)} correlated subplan(s) over events."
         )
 
     async def test_unreacted_rows_is_not_n_plus_1(self, seeded_pool: asyncpg.Pool[Any]) -> None:
@@ -315,6 +355,64 @@ class TestNoCorrelatedSubplanOverEvents:
         )
 
 
+@needs_docker
+class TestSweepIndexCoverage:
+    """The sweep queries that stay logically unbounded (an old unresolved
+    confirmed tool call must remain discoverable forever) must instead be
+    index-covered. ``SET LOCAL enable_seqscan = off`` makes the planner
+    reveal whether an index path *exists* for the exact production query
+    text; asserting the partial index's name proves its predicate still
+    matches the query's WHERE clause."""
+
+    async def _plan_with_seqscan_off(self, pool: asyncpg.Pool[Any], sql: str, *args: Any) -> str:
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute("SET LOCAL enable_seqscan = off")
+            result = await conn.fetchval(f"EXPLAIN (FORMAT JSON) {sql}", *args)
+        if isinstance(result, str):
+            return result
+        return json.dumps(result)
+
+    async def test_confirmed_rows_rides_the_tool_confirmed_partial_index(
+        self, seeded_pool: asyncpg.Pool[Any]
+    ) -> None:
+        """Before migration 0066 nothing indexed ``kind = 'lifecycle'``, so
+        the unscoped CONFIRMED_ROWS_SQL was a full seq scan of ``events``
+        on every 30s sweep pass."""
+        plan_text = await self._plan_with_seqscan_off(
+            seeded_pool, CONFIRMED_ROWS_SQL.format(scope_clause="")
+        )
+        assert "events_tool_confirmed_allow_idx" in plan_text, (
+            "CONFIRMED_ROWS_SQL no longer matches the events_tool_confirmed_allow_idx "
+            "partial index (migration 0066) — the unscoped sweep query has regressed "
+            f"to scanning events. Plan: {plan_text}"
+        )
+
+    async def test_ghost_lifecycle_probe_rides_the_tool_confirmed_partial_index(
+        self, seeded_pool: asyncpg.Pool[Any]
+    ) -> None:
+        plan_text = await self._plan_with_seqscan_off(
+            seeded_pool, GHOST_LIFECYCLE_SQL, ["sess_perf_000"], ["tc_0"]
+        )
+        assert "events_tool_confirmed_allow_idx" in plan_text, (
+            "GHOST_LIFECYCLE_SQL no longer matches the events_tool_confirmed_allow_idx "
+            f"partial index (migration 0066). Plan: {plan_text}"
+        )
+
+    async def test_errored_user_max_rides_the_user_message_partial_index(
+        self, seeded_pool: asyncpg.Pool[Any]
+    ) -> None:
+        """The errored derivation's user-message MAX must use the
+        role-predicated partial index (migration 0066) instead of
+        heap-filtering every message row of the consulted sessions."""
+        plan_text = await self._plan_with_seqscan_off(
+            seeded_pool, ERRORED_SESSIONS_SQL.format(scope_clause="")
+        )
+        assert "events_session_user_seq_idx" in plan_text, (
+            "ERRORED_SESSIONS_SQL's user_max CTE no longer matches the "
+            f"events_session_user_seq_idx partial index (migration 0066). Plan: {plan_text}"
+        )
+
+
 # ─── budget smoke (secondary, slow-marker) ───────────────────────────────────
 
 
@@ -328,7 +426,7 @@ class TestSweepQueryBudget:
     async def test_candidate_rows_buffer_budget(self, seeded_pool: asyncpg.Pool[Any]) -> None:
         async with seeded_pool.acquire() as conn:
             result = await conn.fetchval(
-                f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {CANDIDATE_ROWS_SQL.format(scope_clause='', cte_scope_clause='')}"
+                f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {_CANDIDATE_UNBOUNDED}"
             )
         if isinstance(result, str):
             result = json.loads(result)
