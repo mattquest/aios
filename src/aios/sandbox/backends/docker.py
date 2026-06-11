@@ -129,9 +129,28 @@ class DockerBackend:
         for key, value in spec.environment.items():
             argv.extend(["--env", f"{key}={value}"])
 
-        # Only pull from registry for remote images; local/bare tags (dev builds) have no registry prefix
+        # Refresh remote images best-effort before the run; local/bare tags
+        # (dev builds) have no registry prefix and are never pulled. This
+        # replaces the ``--pull always`` run flag (#567), which made
+        # registry reachability a hard dependency of every sandbox
+        # cold-start: an offline host, registry outage, or a pull running
+        # past the CLI timeout failed provisioning even with a usable
+        # local image. A failed or slow pull now degrades to the local
+        # copy; a genuinely absent image still fails loud at ``docker
+        # run`` below (default ``--pull missing`` semantics).
         if _is_registry_image(spec.image):
-            argv.extend(["--pull", "always"])
+            try:
+                rc, _pull_stdout, stderr_bytes = await run_docker_cli(
+                    ["docker", "pull", "--quiet", spec.image]
+                )
+                if rc != 0:
+                    log.warning(
+                        "sandbox.image_pull_failed",
+                        image=spec.image,
+                        stderr=stderr_bytes.decode("utf-8", errors="replace").strip()[:500],
+                    )
+            except SandboxBackendError as exc:
+                log.warning("sandbox.image_pull_failed", image=spec.image, error=str(exc))
         argv.append(spec.image)
 
         rc, stdout_bytes, stderr_bytes = await run_docker_cli(argv)
@@ -323,9 +342,9 @@ def _is_registry_image(image: str) -> bool:
     """Return True if *image* refers to a remote registry (not a bare local tag).
 
     Docker treats bare names (e.g. ``aios-sandbox:latest``) as
-    ``docker.io/library/<name>``, so ``--pull always`` would trigger a Hub
-    lookup that fails for locally-built images.  We only add the flag when the
-    image clearly references a remote registry.
+    ``docker.io/library/<name>``, so pulling would trigger a Hub lookup
+    that fails for locally-built images.  We only attempt the pre-run
+    refresh pull when the image clearly references a remote registry.
 
     Rules:
     - Single component (no ``/``) → bare name, local.
@@ -334,7 +353,7 @@ def _is_registry_image(image: str) -> bool:
     - First component is ``localhost`` → local registry, but still a daemon
       push/pull target → treat as registry.
     - Otherwise (e.g. ``myorg/myimage``) → Docker Hub short form, no explicit
-      hostname → local-enough that ``--pull always`` is unsafe.
+      hostname → local-enough that pulling is unsafe.
 
     Note: only the *first* path component is inspected, so a tag suffix on
     the final component (e.g. ``localhost:5000/foo:bar``) does not confuse
