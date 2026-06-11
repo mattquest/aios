@@ -90,6 +90,28 @@ and will not wake until a user message arrives.
 
 MAX_USER_MESSAGE_CHARS = 1_000_000
 
+# Auto-title budget: first user message → session title, capped here.
+MAX_DERIVED_TITLE_CHARS = 60
+
+
+def derive_session_title(content: str) -> str | None:
+    """Derive a session title from the first user message's text.
+
+    Whitespace-collapsed, truncated to :data:`MAX_DERIVED_TITLE_CHARS` on a
+    word boundary with a trailing ellipsis. Returns ``None`` for
+    whitespace-only content (no title can be derived). Used by
+    :func:`aios.db.queries.append_event` to fill in a NULL/empty title when
+    the first user message lands — never to overwrite an operator-set title.
+    """
+    collapsed = " ".join(content.split())
+    if not collapsed:
+        return None
+    if len(collapsed) <= MAX_DERIVED_TITLE_CHARS:
+        return collapsed
+    cut = collapsed[:MAX_DERIVED_TITLE_CHARS]
+    head, _, _ = cut.rpartition(" ")
+    return (head or cut).rstrip() + "…"
+
 
 class SessionUsage(BaseModel):
     """Cumulative token usage across all model calls in a session."""

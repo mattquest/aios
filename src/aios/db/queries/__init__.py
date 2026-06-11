@@ -77,7 +77,7 @@ from aios.models.scheduled_tasks import (
     compute_next_fire,
 )
 from aios.models.session_templates import SessionTemplate
-from aios.models.sessions import Session, SessionStatus, SessionUsage
+from aios.models.sessions import Session, SessionStatus, SessionUsage, derive_session_title
 from aios.models.skills import AgentSkillRef, Skill, SkillVersion
 from aios.models.usage import UsageRow
 from aios.models.vaults import AuthType, Vault, VaultCredential
@@ -2227,16 +2227,30 @@ async def append_event(
     # ``_SESSION_ERRORED_EXPR``), and the sweep stops skipping it (#39, #353).
     is_user_message = kind == "message" and role == "user"
 
+    # Auto-title: the first user message names an untitled session. Folded
+    # into the seq-allocating UPDATE (same transaction, same row lock) as a
+    # conditional write that only fires while ``title`` is NULL/empty — an
+    # operator-set title (e.g. from the wizard) is never overwritten.
+    derived_title: str | None = None
+    if is_user_message:
+        raw_content = data.get("content")
+        if isinstance(raw_content, str):
+            derived_title = derive_session_title(raw_content)
+
     async with conn.transaction():
         seq_row = await conn.fetchrow(
             "UPDATE sessions "
             "SET last_event_seq = last_event_seq + 1, "
-            "    updated_at = CASE WHEN $3 THEN now() ELSE updated_at END "
+            "    updated_at = CASE WHEN $3 THEN now() ELSE updated_at END, "
+            "    title = CASE WHEN $4::text IS NOT NULL "
+            "                  AND (title IS NULL OR title = '') "
+            "                 THEN $4 ELSE title END "
             "WHERE id = $1 AND account_id = $2 AND archived_at IS NULL "
             "RETURNING last_event_seq, focal_channel",
             session_id,
             account_id,
             is_user_message,
+            derived_title,
         )
         if seq_row is None:
             # Treat archived as "session no longer exists for write purposes."
