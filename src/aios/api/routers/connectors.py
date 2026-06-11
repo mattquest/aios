@@ -29,6 +29,7 @@ from fastapi import APIRouter, File, Form, UploadFile, status
 from pydantic import BaseModel, ConfigDict
 from sse_starlette import EventSourceResponse
 
+from aios.alerts import send_alert
 from aios.api.deps import (
     AccountIdDep,
     CryptoBoxDep,
@@ -246,6 +247,19 @@ class RuntimeLifecycleRequest(BaseModel):
     event: str
     reason: str | None = None
     data: dict[str, Any] | None = None
+
+
+class RuntimeHeartbeatRequest(BaseModel):
+    """Body for ``POST /v1/connectors/runtime/heartbeat``.
+
+    The runtime sends the ids of the connections it is actively serving
+    (its in-memory served set) every ~30s. An empty list is valid — a
+    healthy container with no connections yet has nothing to stamp.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connection_ids: list[str]
 
 
 def _check_runtime_scope(auth_connector: str, target_connector: str) -> None:
@@ -507,10 +521,49 @@ async def post_runtime_lifecycle(
                 detail=str(exc)[:300],
             )
             failed.append({"session_id": sess_id, "error": type(exc).__name__})
+    send_alert(
+        "connector_lifecycle",
+        connector=connection.connector,
+        connection_id=body.connection_id,
+        event=body.event,
+        reason=body.reason,
+        appended_sessions=len(appended),
+        failed_sessions=len(failed),
+    )
     result: dict[str, Any] = {"appended_session_ids": appended}
     if failed:
         result["failed_session_ids"] = failed
     return result
+
+
+@router.post(
+    "/runtime/heartbeat",
+    operation_id="post_connector_runtime_heartbeat",
+)
+async def post_runtime_heartbeat(
+    body: RuntimeHeartbeatRequest,
+    pool: PoolDep,
+    auth: RuntimeAuthDep,
+) -> dict[str, int]:
+    """Stamp liveness on the connections this runtime is actively serving.
+
+    The bearer's connector type + account scope the UPDATE itself, so a
+    token can never freshen a foreign connection; a bearer-side
+    ``connection_ids`` allowlist (#350) additionally filters the input.
+    Returns ``{"stamped": n}`` — a caller submitting ids it no longer
+    owns (archived mid-flight) simply sees a lower count.
+    """
+    _, auth_connector, account_id, auth_connection_ids = auth
+    ids = body.connection_ids
+    if auth_connection_ids is not None:
+        ids = [i for i in ids if i in auth_connection_ids]
+    if not ids:
+        return {"stamped": 0}
+    async with pool.acquire() as conn:
+        stamped = await queries.heartbeat_connections(
+            conn, ids, connector=auth_connector, account_id=account_id
+        )
+    return {"stamped": stamped}
 
 
 @router.post(

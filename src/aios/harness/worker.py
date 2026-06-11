@@ -41,6 +41,7 @@ from aios.harness.exit_diagnostics import install_exit_diagnostics
 from aios.harness.procrastinate_app import app as procrastinate_app
 from aios.harness.scheduler import event_driven_scheduler
 from aios.harness.sweep import (
+    alert_stale_connections,
     reap_stalled_jobs,
     wake_sessions_needing_inference,
 )
@@ -389,6 +390,7 @@ async def _periodic_sweep(
             woken_runs = await wake_runs_needing_step(pool)
             if woken_runs:
                 log.info("periodic_sweep.workflows", woken_runs=woken_runs)
+            await alert_stale_connections(pool)
         except Exception:
             log.exception("periodic_sweep.failed")
 

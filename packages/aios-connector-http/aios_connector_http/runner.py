@@ -554,6 +554,7 @@ class HttpConnector:
                     tg.create_task(self._discovery_loop(tg), name="aios-discovery")
                     tg.create_task(self._tool_loop(), name="aios-tool-loop")
                     tg.create_task(self._management_call_loop(), name="aios-management-loop")
+                    tg.create_task(self._heartbeat_loop(), name="aios-heartbeat-loop")
                     self._ready_event.set()  # all background loops scheduled
             finally:
                 self._ready_event.clear()
@@ -995,6 +996,38 @@ class HttpConnector:
                 continue
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
+
+    async def _heartbeat_loop(self, *, interval: float = 30.0) -> None:
+        """Stamp liveness on the served connections every ``interval`` seconds.
+
+        Powers the ``GET /health/ready`` per-connection liveness signal —
+        the runtime's steady state is otherwise three silent SSE reads, so
+        an idle-but-healthy container would look indistinguishable from a
+        dead one. Best-effort: failures log and wait for the next beat
+        (the readiness surface reports staleness; this loop must never
+        tear the container down).
+        """
+        client = self._require_client()
+        while True:
+            try:
+                response = await client.get_async_httpx_client().post(
+                    "/v1/connectors/runtime/heartbeat",
+                    json={"connection_ids": list(self._connections)},
+                )
+                if response.is_error:
+                    log.warning(
+                        "connector.heartbeat.failed",
+                        connector=self.connector,
+                        status_code=response.status_code,
+                        body=response.text[:500],
+                    )
+            except httpx.HTTPError as exc:
+                log.warning(
+                    "connector.heartbeat.failed",
+                    connector=self.connector,
+                    error=type(exc).__name__,
+                )
+            await asyncio.sleep(interval)
 
     async def dispatch_management_call(self, call: dict[str, Any]) -> None:
         """Run the management handler for ``call`` and POST the result.

@@ -313,6 +313,13 @@ class Settings(BaseSettings):
 
     # ── observability ──────────────────────────────────────────────────────
     log_level: str = Field(default="INFO")
+    alert_webhook_url: str | None = Field(
+        default=None,
+        description="When set, operational alerts (terminal session errors, "
+        "stalled-job reaps, connector runtime lifecycle events) are POSTed "
+        "as JSON to this URL. Fire-and-forget with a 5s total timeout; "
+        "failures log a warning and are never retried.",
+    )
 
     @property
     def oauth_allow_insecure_host_set(self) -> frozenset[str]:

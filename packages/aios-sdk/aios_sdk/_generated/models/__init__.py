@@ -52,6 +52,12 @@ from .event import Event
 from .event_data import EventData
 from .event_kind import EventKind
 from .file_upload_response import FileUploadResponse
+from .get_health_ready_response_get_health_ready import (
+    GetHealthReadyResponseGetHealthReady,
+)
+from .get_health_ready_v1_response_get_health_ready_v1 import (
+    GetHealthReadyV1ResponseGetHealthReadyV1,
+)
 from .get_health_response_get_health import GetHealthResponseGetHealth
 from .get_health_v1_response_get_health_v1 import GetHealthV1ResponseGetHealthV1
 from .github_repository_resource import GithubRepositoryResource
@@ -125,10 +131,14 @@ from .o_auth_start_request_token_endpoint_auth_method_type_0 import (
     OAuthStartRequestTokenEndpointAuthMethodType0,
 )
 from .o_auth_start_response import OAuthStartResponse
+from .post_connector_runtime_heartbeat_response_post_connector_runtime_heartbeat import (
+    PostConnectorRuntimeHeartbeatResponsePostConnectorRuntimeHeartbeat,
+)
 from .post_connector_runtime_lifecycle_response_post_connector_runtime_lifecycle import (
     PostConnectorRuntimeLifecycleResponsePostConnectorRuntimeLifecycle,
 )
 from .recent_chat import RecentChat
+from .runtime_heartbeat_request import RuntimeHeartbeatRequest
 from .runtime_lifecycle_request import RuntimeLifecycleRequest
 from .runtime_lifecycle_request_data_type_0 import RuntimeLifecycleRequestDataType0
 from .runtime_management_call_result_request import RuntimeManagementCallResultRequest
@@ -279,6 +289,8 @@ __all__ = (
     "EventData",
     "EventKind",
     "FileUploadResponse",
+    "GetHealthReadyResponseGetHealthReady",
+    "GetHealthReadyV1ResponseGetHealthReadyV1",
     "GetHealthResponseGetHealth",
     "GetHealthV1ResponseGetHealthV1",
     "GithubRepositoryResource",
@@ -346,8 +358,10 @@ __all__ = (
     "OAuthStartRequest",
     "OAuthStartRequestTokenEndpointAuthMethodType0",
     "OAuthStartResponse",
+    "PostConnectorRuntimeHeartbeatResponsePostConnectorRuntimeHeartbeat",
     "PostConnectorRuntimeLifecycleResponsePostConnectorRuntimeLifecycle",
     "RecentChat",
+    "RuntimeHeartbeatRequest",
     "RuntimeLifecycleRequest",
     "RuntimeLifecycleRequestDataType0",
     "RuntimeManagementCallResultRequest",

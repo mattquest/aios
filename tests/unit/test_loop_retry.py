@@ -264,5 +264,10 @@ class TestRunSessionStepOnModelError:
         stop_reasons = [
             call.args[2] for call in mock_step_dependencies.set_stop_reason.call_args_list
         ]
-        assert {"type": "error"} in stop_reasons
+        # The terminal stop_reason carries the error details so list
+        # surfaces can show the reason without a lifecycle-event fetch.
+        error_reasons = [r for r in stop_reasons if r.get("type") == "error"]
+        assert len(error_reasons) == 1
+        assert error_reasons[0]["error_type"] == "RuntimeError"
+        assert error_reasons[0]["error_message"] == "provider boom"
         assert {"type": "end_turn"} not in stop_reasons

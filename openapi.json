@@ -52,6 +52,48 @@
         }
       }
     },
+    "/v1/health/ready": {
+      "get": {
+        "summary": "Health Ready",
+        "description": "Readiness: DB reachability, worker freshness, connection liveness.\n\n- ``db`` \u2014 can the API reach Postgres at all.\n- ``worker`` \u2014 newest ``procrastinate_workers.last_heartbeat`` within\n  60s means at least one live worker is consuming jobs.\n- ``connections`` \u2014 per-connection runtime heartbeats (stamped every\n  ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);\n  ``alive`` = stamped within 90s.\n\nReturns 503 when the DB is unreachable or no fresh worker exists \u2014\nthe conditions where the deployment cannot do its job. Dead\nconnections are reported as data but do NOT flip the status code:\na single dead messaging container shouldn't pull the API out of a\nload balancer rotation.\n\nThis route is the one legitimate place that catches a DB failure\ninstead of letting it propagate \u2014 its entire job is reporting it.",
+        "operationId": "get_health_ready_v1",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Health Ready V1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "summary": "Health Ready",
+        "description": "Readiness: DB reachability, worker freshness, connection liveness.\n\n- ``db`` \u2014 can the API reach Postgres at all.\n- ``worker`` \u2014 newest ``procrastinate_workers.last_heartbeat`` within\n  60s means at least one live worker is consuming jobs.\n- ``connections`` \u2014 per-connection runtime heartbeats (stamped every\n  ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);\n  ``alive`` = stamped within 90s.\n\nReturns 503 when the DB is unreachable or no fresh worker exists \u2014\nthe conditions where the deployment cannot do its job. Dead\nconnections are reported as data but do NOT flip the status code:\na single dead messaging container shouldn't pull the API out of a\nload balancer rotation.\n\nThis route is the one legitimate place that catches a DB failure\ninstead of letting it propagate \u2014 its entire job is reporting it.",
+        "operationId": "get_health_ready",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Health Ready"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/accounts/bootstrap": {
       "post": {
         "tags": [
@@ -7181,6 +7223,70 @@
         }
       }
     },
+    "/v1/connectors/runtime/heartbeat": {
+      "post": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "Post Runtime Heartbeat",
+        "description": "Stamp liveness on the connections this runtime is actively serving.\n\nThe bearer's connector type + account scope the UPDATE itself, so a\ntoken can never freshen a foreign connection; a bearer-side\n``connection_ids`` allowlist (#350) additionally filters the input.\nReturns ``{\"stamped\": n}`` \u2014 a caller submitting ids it no longer\nowns (archived mid-flight) simply sees a lower count.",
+        "operationId": "post_connector_runtime_heartbeat",
+        "parameters": [
+          {
+            "name": "Authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeHeartbeatRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "integer"
+                  },
+                  "title": "Response Post Connector Runtime Heartbeat"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/connectors/runtime/tool-results": {
       "post": {
         "tags": [
@@ -11459,6 +11565,24 @@
         ],
         "title": "RecentChat",
         "description": "Distinct chat_id observed on a connection's account, with the\nmost-recent inbound timestamp.\n\nReturned by ``GET /v1/connections/{id}/recent-chats`` so operators\ncan find the chat_id for a specific peer without digging through\nevent logs before calling ``bind-chat``."
+      },
+      "RuntimeHeartbeatRequest": {
+        "properties": {
+          "connection_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Connection Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "connection_ids"
+        ],
+        "title": "RuntimeHeartbeatRequest",
+        "description": "Body for ``POST /v1/connectors/runtime/heartbeat``.\n\nThe runtime sends the ids of the connections it is actively serving\n(its in-memory served set) every ~30s. An empty list is valid \u2014 a\nhealthy container with no connections yet has nothing to stamp."
       },
       "RuntimeLifecycleRequest": {
         "properties": {

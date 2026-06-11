@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, Literal
 
+from aios.alerts import send_alert
 from aios.db.sse_lock import has_subscriber
 from aios.harness import runtime
 from aios.harness.completion import call_litellm, stream_litellm
@@ -959,8 +960,11 @@ async def _apply_retry_or_failure(
     # the sweep skips (see ``sweep.ERRORED_SESSIONS_SQL``); any in-flight tool
     # task that completes after this point sits unreaped until a user message
     # recovers the session (its seq overtakes the error event).
+    # error_type/error_message ride on the stop_reason too, so list
+    # surfaces (console session list, needs-attention) can show the
+    # reason without a per-session lifecycle-event fetch.
     await sessions_service.set_session_stop_reason(
-        pool, session_id, {"type": "error"}, account_id=account_id
+        pool, session_id, {"type": "error", **error_fields}, account_id=account_id
     )
     await _append_lifecycle(
         pool,
@@ -970,6 +974,12 @@ async def _apply_retry_or_failure(
         "error",
         account_id=account_id,
         extra=error_fields,
+    )
+    send_alert(
+        "session_terminal_error",
+        session_id=session_id,
+        account_id=account_id,
+        **error_fields,
     )
     try:
         await _narrate_terminal_failure(

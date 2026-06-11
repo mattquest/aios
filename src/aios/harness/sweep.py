@@ -27,6 +27,8 @@ import asyncpg
 if TYPE_CHECKING:
     from aios.models.agents import ToolSpec
 
+from aios.alerts import send_alert
+from aios.db import queries
 from aios.db.queries import parse_jsonb
 from aios.harness.task_registry import TaskRegistry
 from aios.logging import get_logger
@@ -637,7 +639,55 @@ async def reap_stalled_jobs(job_manager: Any) -> int:
             count=len(stalled),
             ids=[j.id for j in stalled],
         )
+        send_alert(
+            "stalled_jobs_reaped",
+            count=len(stalled),
+            job_ids=[j.id for j in stalled],
+        )
     return len(stalled)
+
+
+# Matches the /health/ready connection-staleness threshold
+# (api/routers/health.py): 3x the runtime's 30s heartbeat interval.
+_CONNECTION_STALE_SECONDS = 90.0
+
+# Last-known liveness per connection id, for alerting only on
+# transitions (alive→stale, stale→recovered) instead of every sweep.
+# Worker-process memory: a worker restart re-learns silently, which is
+# correct — no flood of "recovered" alerts on boot.
+_connection_alive: dict[str, bool] = {}
+
+
+async def alert_stale_connections(pool: asyncpg.Pool[Any]) -> None:
+    """Alert on connection-liveness transitions (stale ↔ recovered).
+
+    Reads the same ``connections.last_runtime_heartbeat_at`` signal the
+    readiness surface reports, so a connector whose inbound died while
+    its process stayed up produces an operator alert, not just a console
+    cell. A connection that has never heartbeated (NULL) is skipped —
+    pre-upgrade rows and freshly-created connections shouldn't alert.
+    """
+    from datetime import UTC, datetime
+
+    async with pool.acquire() as conn:
+        rows = await queries.list_connection_liveness(conn)
+    now = datetime.now(UTC)
+    for r in rows:
+        hb = r["last_runtime_heartbeat_at"]
+        if hb is None:
+            continue
+        alive = (now - hb).total_seconds() < _CONNECTION_STALE_SECONDS
+        previous = _connection_alive.get(r["id"])
+        _connection_alive[r["id"]] = alive
+        if previous is None or previous == alive:
+            continue
+        send_alert(
+            "connection_stale" if not alive else "connection_recovered",
+            connection_id=r["id"],
+            connector=r["connector"],
+            external_account_id=r["external_account_id"],
+            last_heartbeat_at=hb.isoformat(),
+        )
 
 
 # ─── main entry point ────────────────────────────────────────────────────────

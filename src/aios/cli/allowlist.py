@@ -86,6 +86,16 @@ NOT_CLI_OPERATIONS: dict[str, str] = {
         "Alias of get_health at /v1/health (docs have referenced both paths); "
         "`aios status` covers the canonical /health."
     ),
+    "get_health_ready_v1": ("Alias of get_health_ready at /v1/health/ready; same payload."),
+    # ── Readiness probe ──────────────────────────────────────────────
+    "get_health_ready": (
+        "Operator readiness surface consumed by monitors and the console "
+        "status strip; curl-able without auth. CLI surface adds nothing."
+    ),
+    # ── Connector-runtime heartbeat ──────────────────────────────────
+    "post_connector_runtime_heartbeat": (
+        "Called by connector containers via runtime token every ~30s; not for operators."
+    ),
 }
 
 NEEDS_CLI_TRACKED: dict[str, str] = {

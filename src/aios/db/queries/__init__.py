@@ -4077,6 +4077,71 @@ async def get_connection(
     return _row_to_connection(row)
 
 
+async def heartbeat_connections(
+    conn: asyncpg.Connection[Any],
+    connection_ids: list[str],
+    *,
+    connector: str,
+    account_id: str,
+) -> int:
+    """Stamp ``last_runtime_heartbeat_at = now()`` on actively-served connections.
+
+    Called by the connector runtime's periodic heartbeat. Scoped to the
+    runtime's connector type + account so a token can never freshen a
+    foreign connection. Deliberately does NOT bump ``updated_at`` — the
+    heartbeat is liveness telemetry, not a config change. Returns the
+    number of rows stamped.
+    """
+    result = await conn.execute(
+        """
+        UPDATE connections
+           SET last_runtime_heartbeat_at = now()
+         WHERE id = ANY($1)
+           AND connector = $2
+           AND account_id = $3
+           AND archived_at IS NULL
+        """,
+        connection_ids,
+        connector,
+        account_id,
+    )
+    return int(result.split()[-1])
+
+
+async def max_worker_heartbeat(conn: asyncpg.Connection[Any]) -> datetime | None:
+    """Newest procrastinate worker heartbeat, or None when no worker row exists.
+
+    procrastinate workers refresh ``procrastinate_workers.last_heartbeat``
+    every ~10s; a recent MAX means at least one live worker. Stale rows of
+    dead workers linger until pruned, so only the MAX is meaningful.
+    """
+    return cast(
+        "datetime | None",
+        await conn.fetchval("SELECT MAX(last_heartbeat) FROM procrastinate_workers"),
+    )
+
+
+async def list_connection_liveness(
+    conn: asyncpg.Connection[Any],
+) -> list[asyncpg.Record]:
+    """All unarchived connections with their runtime-heartbeat timestamps.
+
+    Cross-account by design: this feeds the unauthenticated operator
+    readiness surface (``GET /health/ready``) of a self-hosted deployment.
+    """
+    return cast(
+        "list[asyncpg.Record]",
+        await conn.fetch(
+            """
+            SELECT id, connector, external_account_id, last_runtime_heartbeat_at
+              FROM connections
+             WHERE archived_at IS NULL
+             ORDER BY connector, id
+            """
+        ),
+    )
+
+
 async def set_connection_secrets(
     conn: asyncpg.Connection[Any],
     connection_id: str,
