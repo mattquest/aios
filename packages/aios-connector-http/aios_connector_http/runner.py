@@ -997,7 +997,7 @@ class HttpConnector:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
 
-    async def _heartbeat_loop(self, *, interval: float = 30.0) -> None:
+    async def _heartbeat_loop(self, *, interval: float = 15.0) -> None:
         """Stamp liveness on the served connections every ``interval`` seconds.
 
         Powers the ``GET /health/ready`` per-connection liveness signal —

@@ -18,8 +18,8 @@ router = APIRouter()
 # A worker heartbeats procrastinate_workers.last_heartbeat every ~10s;
 # 60s matches reap_stalled_jobs' staleness threshold.
 _WORKER_STALE_SECONDS = 60.0
-# The connector runtime heartbeats every 30s; 3 intervals of grace.
-_CONNECTION_STALE_SECONDS = 90.0
+# The connector runtime heartbeats every 15s; 3 intervals of grace.
+_CONNECTION_STALE_SECONDS = 45.0
 
 
 @router.get("/health", operation_id="get_health")
@@ -46,8 +46,8 @@ async def health_ready(pool: PoolDep, response: Response) -> dict[str, object]:
     - ``worker`` — newest ``procrastinate_workers.last_heartbeat`` within
       60s means at least one live worker is consuming jobs.
     - ``connections`` — per-connection runtime heartbeats (stamped every
-      ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
-      ``alive`` = stamped within 90s.
+      ~15s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
+      ``alive`` = stamped within 45s.
 
     Returns 503 when the DB is unreachable or no fresh worker exists —
     the conditions where the deployment cannot do its job. Dead

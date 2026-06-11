@@ -161,6 +161,40 @@ jobs:
       - name: Unit tests
         run: uv run pytest tests/unit -q
 
+  # The messaging connectors and the shared connector-http runner are
+  # standalone uv projects with their own (fast, dependency-light) test
+  # suites — previously never run in CI, so connector regressions only
+  # surfaced in production.
+  connectors:
+    needs: detect
+    if: needs.detect.outputs.run_checks == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - connectors/signal
+          - connectors/telegram
+          - connectors/whatsapp
+          - packages/aios-connector-http
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.13
+        run: uv python install 3.13
+
+      - name: Test ${{ matrix.suite }}
+        working-directory: ${{ matrix.suite }}
+        run: |
+          uv sync --dev
+          uv run pytest tests -q
+
   integration:
     needs: detect
     if: needs.detect.outputs.run_checks == 'true'

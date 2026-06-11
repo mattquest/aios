@@ -648,8 +648,8 @@ async def reap_stalled_jobs(job_manager: Any) -> int:
 
 
 # Matches the /health/ready connection-staleness threshold
-# (api/routers/health.py): 3x the runtime's 30s heartbeat interval.
-_CONNECTION_STALE_SECONDS = 90.0
+# (api/routers/health.py): 3x the runtime's 15s heartbeat interval.
+_CONNECTION_STALE_SECONDS = 45.0
 
 # Last-known liveness per connection id, for alerting only on
 # transitions (alive→stale, stale→recovered) instead of every sweep.

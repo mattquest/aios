@@ -55,7 +55,7 @@
     "/v1/health/ready": {
       "get": {
         "summary": "Health Ready",
-        "description": "Readiness: DB reachability, worker freshness, connection liveness.\n\n- ``db`` \u2014 can the API reach Postgres at all.\n- ``worker`` \u2014 newest ``procrastinate_workers.last_heartbeat`` within\n  60s means at least one live worker is consuming jobs.\n- ``connections`` \u2014 per-connection runtime heartbeats (stamped every\n  ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);\n  ``alive`` = stamped within 90s.\n\nReturns 503 when the DB is unreachable or no fresh worker exists \u2014\nthe conditions where the deployment cannot do its job. Dead\nconnections are reported as data but do NOT flip the status code:\na single dead messaging container shouldn't pull the API out of a\nload balancer rotation.\n\nThis route is the one legitimate place that catches a DB failure\ninstead of letting it propagate \u2014 its entire job is reporting it.",
+        "description": "Readiness: DB reachability, worker freshness, connection liveness.\n\n- ``db`` \u2014 can the API reach Postgres at all.\n- ``worker`` \u2014 newest ``procrastinate_workers.last_heartbeat`` within\n  60s means at least one live worker is consuming jobs.\n- ``connections`` \u2014 per-connection runtime heartbeats (stamped every\n  ~15s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);\n  ``alive`` = stamped within 45s.\n\nReturns 503 when the DB is unreachable or no fresh worker exists \u2014\nthe conditions where the deployment cannot do its job. Dead\nconnections are reported as data but do NOT flip the status code:\na single dead messaging container shouldn't pull the API out of a\nload balancer rotation.\n\nThis route is the one legitimate place that catches a DB failure\ninstead of letting it propagate \u2014 its entire job is reporting it.",
         "operationId": "get_health_ready_v1",
         "responses": {
           "200": {
@@ -76,7 +76,7 @@
     "/health/ready": {
       "get": {
         "summary": "Health Ready",
-        "description": "Readiness: DB reachability, worker freshness, connection liveness.\n\n- ``db`` \u2014 can the API reach Postgres at all.\n- ``worker`` \u2014 newest ``procrastinate_workers.last_heartbeat`` within\n  60s means at least one live worker is consuming jobs.\n- ``connections`` \u2014 per-connection runtime heartbeats (stamped every\n  ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);\n  ``alive`` = stamped within 90s.\n\nReturns 503 when the DB is unreachable or no fresh worker exists \u2014\nthe conditions where the deployment cannot do its job. Dead\nconnections are reported as data but do NOT flip the status code:\na single dead messaging container shouldn't pull the API out of a\nload balancer rotation.\n\nThis route is the one legitimate place that catches a DB failure\ninstead of letting it propagate \u2014 its entire job is reporting it.",
+        "description": "Readiness: DB reachability, worker freshness, connection liveness.\n\n- ``db`` \u2014 can the API reach Postgres at all.\n- ``worker`` \u2014 newest ``procrastinate_workers.last_heartbeat`` within\n  60s means at least one live worker is consuming jobs.\n- ``connections`` \u2014 per-connection runtime heartbeats (stamped every\n  ~15s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);\n  ``alive`` = stamped within 45s.\n\nReturns 503 when the DB is unreachable or no fresh worker exists \u2014\nthe conditions where the deployment cannot do its job. Dead\nconnections are reported as data but do NOT flip the status code:\na single dead messaging container shouldn't pull the API out of a\nload balancer rotation.\n\nThis route is the one legitimate place that catches a DB failure\ninstead of letting it propagate \u2014 its entire job is reporting it.",
         "operationId": "get_health_ready",
         "responses": {
           "200": {
@@ -11582,7 +11582,7 @@
           "connection_ids"
         ],
         "title": "RuntimeHeartbeatRequest",
-        "description": "Body for ``POST /v1/connectors/runtime/heartbeat``.\n\nThe runtime sends the ids of the connections it is actively serving\n(its in-memory served set) every ~30s. An empty list is valid \u2014 a\nhealthy container with no connections yet has nothing to stamp."
+        "description": "Body for ``POST /v1/connectors/runtime/heartbeat``.\n\nThe runtime sends the ids of the connections it is actively serving\n(its in-memory served set) every ~15s. An empty list is valid \u2014 a\nhealthy container with no connections yet has nothing to stamp."
       },
       "RuntimeLifecycleRequest": {
         "properties": {

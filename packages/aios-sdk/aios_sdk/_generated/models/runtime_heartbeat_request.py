@@ -13,7 +13,7 @@ class RuntimeHeartbeatRequest:
     """Body for ``POST /v1/connectors/runtime/heartbeat``.
 
     The runtime sends the ids of the connections it is actively serving
-    (its in-memory served set) every ~30s. An empty list is valid — a
+    (its in-memory served set) every ~15s. An empty list is valid — a
     healthy container with no connections yet has nothing to stamp.
 
         Attributes:

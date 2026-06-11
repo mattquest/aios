@@ -58,8 +58,8 @@ def sync_detailed(
     - ``worker`` — newest ``procrastinate_workers.last_heartbeat`` within
       60s means at least one live worker is consuming jobs.
     - ``connections`` — per-connection runtime heartbeats (stamped every
-      ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
-      ``alive`` = stamped within 90s.
+      ~15s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
+      ``alive`` = stamped within 45s.
 
     Returns 503 when the DB is unreachable or no fresh worker exists —
     the conditions where the deployment cannot do its job. Dead
@@ -99,8 +99,8 @@ def sync(
     - ``worker`` — newest ``procrastinate_workers.last_heartbeat`` within
       60s means at least one live worker is consuming jobs.
     - ``connections`` — per-connection runtime heartbeats (stamped every
-      ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
-      ``alive`` = stamped within 90s.
+      ~15s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
+      ``alive`` = stamped within 45s.
 
     Returns 503 when the DB is unreachable or no fresh worker exists —
     the conditions where the deployment cannot do its job. Dead
@@ -136,8 +136,8 @@ async def asyncio_detailed(
     - ``worker`` — newest ``procrastinate_workers.last_heartbeat`` within
       60s means at least one live worker is consuming jobs.
     - ``connections`` — per-connection runtime heartbeats (stamped every
-      ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
-      ``alive`` = stamped within 90s.
+      ~15s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
+      ``alive`` = stamped within 45s.
 
     Returns 503 when the DB is unreachable or no fresh worker exists —
     the conditions where the deployment cannot do its job. Dead
@@ -175,8 +175,8 @@ async def asyncio(
     - ``worker`` — newest ``procrastinate_workers.last_heartbeat`` within
       60s means at least one live worker is consuming jobs.
     - ``connections`` — per-connection runtime heartbeats (stamped every
-      ~30s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
-      ``alive`` = stamped within 90s.
+      ~15s by serving runtimes via ``POST /v1/connectors/runtime/heartbeat``);
+      ``alive`` = stamped within 45s.
 
     Returns 503 when the DB is unreachable or no fresh worker exists —
     the conditions where the deployment cannot do its job. Dead

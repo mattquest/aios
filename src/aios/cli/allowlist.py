@@ -94,7 +94,7 @@ NOT_CLI_OPERATIONS: dict[str, str] = {
     ),
     # ── Connector-runtime heartbeat ──────────────────────────────────
     "post_connector_runtime_heartbeat": (
-        "Called by connector containers via runtime token every ~30s; not for operators."
+        "Called by connector containers via runtime token every ~15s; not for operators."
     ),
 }
 
