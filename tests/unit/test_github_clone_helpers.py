@@ -192,14 +192,88 @@ async def test_cache_clone_uses_cache_timeout_not_session_timeout(
 
     await github_clone.ensure_cache_clone("https://github.com/acme/foo", "ghp_TOKEN")
 
-    # Cold-path issues two git invocations: ``clone --bare`` then
-    # ``config gc.auto 0``. Both are cache initialization; both must
-    # use the cache budget.
-    assert fake_run.await_count == 2
+    # Cold-path issues three git invocations: ``clone --bare``, then
+    # ``config gc.auto 0``, then the origin-URL scrub. All are cache
+    # initialization; all must use the cache budget.
+    assert fake_run.await_count == 3
     argvs = [call.args[0] for call in fake_run.await_args_list]
     assert any("clone" in argv and "--bare" in argv for argv in argvs)
     assert any("config" in argv and "gc.auto" in argv for argv in argvs)
+    assert any("set-url" in argv for argv in argvs)
     for call in fake_run.await_args_list:
         assert call.kwargs["timeout_s"] == 99.0, (
             f"expected cache budget (99.0) for {call.args[0]!r}, got {call.kwargs['timeout_s']}"
         )
+
+
+# ─── cache origin-URL scrub ────────────────────────────────────────────────────
+#
+# ``clone --bare`` stores the auth-embedded URL in the cache's config on
+# the host; fetches use a one-shot ``-c`` override and never read the
+# stored copy. These tests pin that the stored URL is replaced with the
+# clean repo URL on both the cold path (post-clone) and the warm path
+# (post-fetch, which self-heals caches created before the scrub existed).
+
+
+def _set_url_calls(fake_run: AsyncMock) -> list[list[str]]:
+    return [call.args[0] for call in fake_run.await_args_list if "set-url" in call.args[0]]
+
+
+async def test_cache_clone_scrubs_token_from_stored_origin_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aios.config import get_settings
+    from aios.sandbox import github_clone
+
+    monkeypatch.setenv("AIOS_WORKSPACE_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+
+    fake_run = AsyncMock(return_value=(0, b"", b"", False))
+    monkeypatch.setattr(github_clone, "run_subprocess_with_timeout", fake_run)
+    monkeypatch.setattr(
+        github_clone,
+        "get_settings",
+        lambda: _settings_stub(session=7.0, cache=99.0),
+    )
+
+    await github_clone.ensure_cache_clone("https://github.com/acme/foo", "ghp_TOKEN")
+
+    scrubs = _set_url_calls(fake_run)
+    assert len(scrubs) == 1
+    assert scrubs[0][-1] == "https://github.com/acme/foo"
+    assert not any("ghp_TOKEN" in part for part in scrubs[0])
+
+
+async def test_cache_fetch_scrubs_stored_origin_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warm path: an existing cache (possibly created before the scrub
+    shipped) gets its stored origin URL replaced after the fetch."""
+    from aios.config import get_settings
+    from aios.sandbox import github_clone
+
+    monkeypatch.setenv("AIOS_WORKSPACE_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+
+    fake_run = AsyncMock(return_value=(0, b"", b"", False))
+    monkeypatch.setattr(github_clone, "run_subprocess_with_timeout", fake_run)
+    monkeypatch.setattr(
+        github_clone,
+        "get_settings",
+        lambda: _settings_stub(session=7.0, cache=99.0),
+    )
+
+    # Materialize the cache dir so ensure_cache_clone takes the fast path.
+    repo_url = "https://github.com/acme/foo"
+    cache_dir = github_clone.github_repo_cache_dir(github_clone.url_hash(repo_url))
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "HEAD").write_text("ref: refs/heads/main\n")
+
+    await github_clone.ensure_cache_clone(repo_url, "ghp_TOKEN")
+
+    argvs = [call.args[0] for call in fake_run.await_args_list]
+    assert any("fetch" in argv for argv in argvs)
+    scrubs = _set_url_calls(fake_run)
+    assert len(scrubs) == 1
+    assert scrubs[0][-1] == repo_url
+    assert not any("ghp_TOKEN" in part for part in scrubs[0])

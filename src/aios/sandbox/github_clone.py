@@ -189,6 +189,25 @@ async def ensure_cache_clone(repo_url: str, token: str) -> Path:
                 op="config gc.auto",
                 timeout_s=settings.github_clone_cache_timeout_seconds,
             )
+            # ``clone --bare`` persisted the auth-embedded URL as
+            # remote.origin.url in the cache's config file on the host.
+            # Fetches pass the URL as a one-shot ``-c`` override, so the
+            # stored copy is never used — replace it with the clean URL
+            # so the token doesn't sit on disk in plaintext.
+            rc, _stdout, stderr = await _run_git(
+                ["remote", "set-url", "origin", repo_url],
+                cwd=cache_dir,
+                op="remote set-url",
+                timeout_s=settings.github_clone_cache_timeout_seconds,
+            )
+            if rc != 0:
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                _raise_redacted_git_error(
+                    stderr,
+                    message=f"failed to scrub origin URL in cache for {repo_url!r}",
+                    token=token,
+                )
             log.info(
                 "github_clone.cache_created",
                 repo_url=repo_url,
@@ -228,6 +247,18 @@ async def _fetch_cache(cache_dir: Path, auth_url: str, repo_url: str) -> None:
             repo_url=repo_url,
             stderr=stderr.decode("utf-8", errors="replace")[:500],
         )
+    # Caches created before the post-clone URL scrub still hold the
+    # auth-embedded URL in their config — replace it on every fetch
+    # (cheap local file op; newly created caches are scrubbed at clone
+    # time). Best-effort, matching the rest of this function.
+    rc, _stdout, _stderr = await _run_git(
+        ["remote", "set-url", "origin", repo_url],
+        cwd=cache_dir,
+        op="remote set-url",
+        timeout_s=settings.github_clone_cache_timeout_seconds,
+    )
+    if rc != 0:
+        log.warning("github_clone.cache_scrub_failed", repo_url=repo_url)
 
 
 async def ensure_session_working_tree(
