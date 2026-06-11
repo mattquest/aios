@@ -81,6 +81,11 @@ NOT_CLI_OPERATIONS: dict[str, str] = {
         "Interactive OAuth: exchanges a browser-redirect authorization code; "
         "driven by the console, not the CLI."
     ),
+    # ── Path aliases ─────────────────────────────────────────────────
+    "get_health_v1": (
+        "Alias of get_health at /v1/health (docs have referenced both paths); "
+        "`aios status` covers the canonical /health."
+    ),
 }
 
 NEEDS_CLI_TRACKED: dict[str, str] = {

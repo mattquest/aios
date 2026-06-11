@@ -53,6 +53,7 @@ from .event_data import EventData
 from .event_kind import EventKind
 from .file_upload_response import FileUploadResponse
 from .get_health_response_get_health import GetHealthResponseGetHealth
+from .get_health_v1_response_get_health_v1 import GetHealthV1ResponseGetHealthV1
 from .github_repository_resource import GithubRepositoryResource
 from .github_repository_resource_echo import GithubRepositoryResourceEcho
 from .github_repository_update import GithubRepositoryUpdate
@@ -279,6 +280,7 @@ __all__ = (
     "EventKind",
     "FileUploadResponse",
     "GetHealthResponseGetHealth",
+    "GetHealthV1ResponseGetHealthV1",
     "GithubRepositoryResource",
     "GithubRepositoryResourceEcho",
     "GithubRepositoryUpdate",

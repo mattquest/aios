@@ -5,7 +5,9 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.get_health_response_get_health import GetHealthResponseGetHealth
+from ...models.get_health_v1_response_get_health_v1 import (
+    GetHealthV1ResponseGetHealthV1,
+)
 from ...types import Response
 
 
@@ -13,7 +15,7 @@ def _get_kwargs() -> dict[str, Any]:
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/health",
+        "url": "/v1/health",
     }
 
     return _kwargs
@@ -21,9 +23,9 @@ def _get_kwargs() -> dict[str, Any]:
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> GetHealthResponseGetHealth | None:
+) -> GetHealthV1ResponseGetHealthV1 | None:
     if response.status_code == 200:
-        response_200 = GetHealthResponseGetHealth.from_dict(response.json())
+        response_200 = GetHealthV1ResponseGetHealthV1.from_dict(response.json())
 
         return response_200
 
@@ -35,7 +37,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[GetHealthResponseGetHealth]:
+) -> Response[GetHealthV1ResponseGetHealthV1]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -47,7 +49,7 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-) -> Response[GetHealthResponseGetHealth]:
+) -> Response[GetHealthV1ResponseGetHealthV1]:
     r"""Health
 
      Liveness probe. Unauthenticated; returns the running aios version.
@@ -64,7 +66,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[GetHealthResponseGetHealth]
+        Response[GetHealthV1ResponseGetHealthV1]
     """
 
     kwargs = _get_kwargs()
@@ -79,7 +81,7 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-) -> GetHealthResponseGetHealth | None:
+) -> GetHealthV1ResponseGetHealthV1 | None:
     r"""Health
 
      Liveness probe. Unauthenticated; returns the running aios version.
@@ -96,7 +98,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        GetHealthResponseGetHealth
+        GetHealthV1ResponseGetHealthV1
     """
 
     return sync_detailed(
@@ -107,7 +109,7 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-) -> Response[GetHealthResponseGetHealth]:
+) -> Response[GetHealthV1ResponseGetHealthV1]:
     r"""Health
 
      Liveness probe. Unauthenticated; returns the running aios version.
@@ -124,7 +126,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[GetHealthResponseGetHealth]
+        Response[GetHealthV1ResponseGetHealthV1]
     """
 
     kwargs = _get_kwargs()
@@ -137,7 +139,7 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-) -> GetHealthResponseGetHealth | None:
+) -> GetHealthV1ResponseGetHealthV1 | None:
     r"""Health
 
      Liveness probe. Unauthenticated; returns the running aios version.
@@ -154,7 +156,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        GetHealthResponseGetHealth
+        GetHealthV1ResponseGetHealthV1
     """
 
     return (

@@ -6,10 +6,33 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/v1/health": {
+      "get": {
+        "summary": "Health",
+        "description": "Liveness probe. Unauthenticated; returns the running aios version.\n\nServed at both ``/health`` and ``/v1/health`` \u2014 docs and clients have\nreferenced both paths.\n\nSuitable for load balancer health checks and monitoring probes. Always\nreturns 200 with ``{\"status\": \"ok\", \"version\": <version>}`` if the\nprocess is up.",
+        "operationId": "get_health_v1",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Get Health V1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Health",
-        "description": "Liveness probe. Unauthenticated; returns the running aios version.\n\nSuitable for load balancer health checks and monitoring probes. Always\nreturns 200 with ``{\"status\": \"ok\", \"version\": <version>}`` if the\nprocess is up.",
+        "description": "Liveness probe. Unauthenticated; returns the running aios version.\n\nServed at both ``/health`` and ``/v1/health`` \u2014 docs and clients have\nreferenced both paths.\n\nSuitable for load balancer health checks and monitoring probes. Always\nreturns 200 with ``{\"status\": \"ok\", \"version\": <version>}`` if the\nprocess is up.",
         "operationId": "get_health",
         "responses": {
           "200": {
