@@ -179,6 +179,24 @@ uv run aios chat --agent <agent_id> --environment-id <env_id> \
 
 Model API keys are configured via standard LiteLLM environment variables: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc. For web tools: `AIOS_TAVILY_API_KEY`. For connectors, see each connector's README.
 
+## Your personal assistant in 15 minutes
+
+With the API running (Quickstart above), one wizard provisions an opinionated, long-lived personal assistant: a PARA-organized memory store, an agent with a generated system prompt, one durable session that floats on the latest agent version, an optional Telegram binding, and scheduled wakes (nightly memory reflection; a morning briefing when a channel is configured).
+
+```bash
+uv run aios assistant init
+```
+
+It prompts for the assistant's name, your name, your timezone, a model, and a channel. Every prompt has a flag for non-interactive use:
+
+```bash
+uv run aios assistant init --name Aria --user-name Sam \
+  --timezone America/Chicago --model anthropic/claude-sonnet-4-6 \
+  --channel telegram --telegram-bot-token <token from @BotFather> --yes
+```
+
+The generated prompt only claims what's actually configured — web tools appear only if `AIOS_TAVILY_API_KEY` is set, and the channel section matches the channel you chose (`--channel none` skips channel setup). Re-running is safe: the memory store and session are reused and the agent is updated in place. For Telegram delivery the connector container must be running — see [connectors/telegram/README.md](connectors/telegram/README.md).
+
 ## Run the full stack with Docker Compose
 
 The Quickstart above runs **lean mode**: postgres in a container, api + worker on the host. That's the fastest hot-reload path while iterating on aios itself.

@@ -95,6 +95,7 @@ def _root(
 # without causing a circular import.
 from aios.cli.commands import accounts as _accounts  # noqa: E402
 from aios.cli.commands import agents as _agents  # noqa: E402
+from aios.cli.commands import assistant as _assistant  # noqa: E402
 from aios.cli.commands import chat as _chat  # noqa: E402
 from aios.cli.commands import connections as _connections  # noqa: E402
 from aios.cli.commands import dev as _dev  # noqa: E402
@@ -112,6 +113,7 @@ from aios.cli.commands import whatsapp as _whatsapp  # noqa: E402
 
 app.add_typer(_accounts.app, name="accounts")
 app.add_typer(_agents.app, name="agents")
+app.add_typer(_assistant.app, name="assistant")
 app.add_typer(_sessions.app, name="sessions")
 app.add_typer(_session_templates.app, name="session-templates")
 app.add_typer(_skills.app, name="skills")

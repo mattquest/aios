@@ -102,15 +102,14 @@ NEEDS_CLI_TRACKED: dict[str, str] = {
     # ── Memory stores (followup) ─────────────────────────────────────
     # Tracked: aios#TBD — single followup issue for `aios memory-stores ...`
     # and `aios memory-stores memories ...` command groups.
-    "list_memory_stores": "needs CLI; tracked in aios#TBD (memory-stores group)",
+    # list/create for stores and memories are covered by `aios assistant
+    # init` (@covers in commands/assistant.py); the rest still need the
+    # dedicated group.
     "get_memory_store": "needs CLI; tracked in aios#TBD (memory-stores group)",
-    "create_memory_store": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "update_memory_store": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "delete_memory_store": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "archive_memory_store": "needs CLI; tracked in aios#TBD (memory-stores group)",
-    "list_memories": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "get_memory": "needs CLI; tracked in aios#TBD (memory-stores group)",
-    "create_memory": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "update_memory": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "delete_memory": "needs CLI; tracked in aios#TBD (memory-stores group)",
     "list_memory_versions": "needs CLI; tracked in aios#TBD (memory-stores group)",
