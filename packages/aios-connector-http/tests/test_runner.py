@@ -641,24 +641,52 @@ class TestFocalChannelHelper:
 class TestIsolatedServeConnection:
     """``_isolated_serve_connection`` wraps ``serve_connection`` so a
     bad bring-up (typo'd secret, unregistered phone) doesn't tear down
-    sibling connections via the parent TaskGroup.  Always pops the
-    user-state slot on exit."""
+    sibling connections via the parent TaskGroup — and restarts it with
+    backoff so a transient failure can't permanently kill inbound
+    delivery.  Always pops the user-state slot between attempts."""
 
-    async def test_swallows_non_cancel_exception(self) -> None:
+    async def test_retries_after_exception_with_backoff(self) -> None:
+        attempts = 0
+
         class _CrashingConnector(HttpConnector):
             connector = "crashy"
 
             async def serve_connection(self, connection_id: str, secrets: dict[str, str]) -> None:
+                nonlocal attempts
+                attempts += 1
                 raise RuntimeError("daemon refused this phone")
 
         c = _CrashingConnector(base_url="http://x", token="aios_runtime_x")
         with structlog.testing.capture_logs() as records:
-            # Should NOT raise.
-            await c._isolated_serve_connection("conn_1", {"phone": "+1..."})
+            task = asyncio.create_task(c._isolated_serve_connection("conn_1", {"phone": "+1..."}))
+            # First attempt fails immediately; the wrapper must stay alive,
+            # back off, and try again rather than dying after one failure.
+            for _ in range(50):
+                if attempts >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            assert not task.done(), "serve wrapper must keep retrying, not exit"
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        assert attempts >= 2
         failed = [r for r in records if r["event"] == "connector.connection.serve_failed"]
-        assert len(failed) == 1
+        assert len(failed) >= 2
         assert failed[0]["connection_id"] == "conn_1"
         assert failed[0]["error"] == "RuntimeError"
+        assert failed[0]["backoff"] == 1.0
+        assert failed[1]["backoff"] == 2.0
+
+    async def test_clean_return_ends_task(self) -> None:
+        class _CleanConnector(HttpConnector):
+            connector = "clean"
+
+            async def serve_connection(self, connection_id: str, secrets: dict[str, str]) -> None:
+                return None
+
+        c = _CleanConnector(base_url="http://x", token="aios_runtime_x")
+        # A clean end of the platform feed must NOT loop forever.
+        await asyncio.wait_for(c._isolated_serve_connection("conn_1", {}), timeout=1.0)
 
     async def test_pops_state_on_cancel(self) -> None:
         class _Connector(HttpConnector):

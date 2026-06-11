@@ -699,25 +699,39 @@ class HttpConnector:
         )
 
     async def _isolated_serve_connection(self, connection_id: str, secrets: dict[str, str]) -> None:
-        """Run :meth:`serve_connection` with failure-isolated cleanup.
+        """Run :meth:`serve_connection`, restarting it with backoff on failure.
 
         Catches any non-``CancelledError`` exception so a single bad
         connection (typo'd secret, unregistered phone, revoked bot
         token) can't tear down sibling connections via the parent
-        TaskGroup.  Always pops the user-state slot on exit so
-        connections cycling in/out don't leak stale state.
+        TaskGroup — and retries with the same backoff ladder the SSE
+        loops use, so a transient failure (an aios API restart racing
+        ``emit_inbound``, a platform blip) can't permanently kill
+        inbound delivery while the container reports healthy.  A run
+        that stayed up ≥60s resets the ladder.  Pops the user-state
+        slot between attempts and on exit so each retry starts clean
+        and connections cycling in/out don't leak stale state.
         """
-        try:
-            await self.serve_connection(connection_id, secrets)
-        except Exception as exc:
-            log.exception(
-                "connector.connection.serve_failed",
-                connector=self.connector,
-                connection_id=connection_id,
-                error=type(exc).__name__,
-            )
-        finally:
-            self.state.pop(connection_id, None)
+        backoff = 1.0
+        while True:
+            started = asyncio.get_running_loop().time()
+            try:
+                await self.serve_connection(connection_id, secrets)
+                return  # platform feed ended cleanly
+            except Exception as exc:
+                log.exception(
+                    "connector.connection.serve_failed",
+                    connector=self.connector,
+                    connection_id=connection_id,
+                    error=type(exc).__name__,
+                    backoff=backoff,
+                )
+            finally:
+                self.state.pop(connection_id, None)
+            if asyncio.get_running_loop().time() - started >= 60.0:
+                backoff = 1.0
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
 
     async def _on_connection_removed(self, connection_id: str) -> None:
         """Cancel the worker task for a vanished connection."""
