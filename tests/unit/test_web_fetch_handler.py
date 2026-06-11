@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from aios.tools.tavily import WebToolError
+from aios.tools.tavily import EXTERNAL_CONTENT_NOTICE, WebToolError
 from aios.tools.web_fetch import WebFetchArgumentError, web_fetch_handler
 
 
@@ -41,8 +41,24 @@ class TestWebFetchHandler:
         result = await web_fetch_handler("sess_01TEST", {"url": "https://example.com"})
         assert result["url"] == "https://example.com"
         assert result["title"] == "Example"
-        assert result["content"] == "# Hello World\n\nSome content."
+        assert result["content"] == f"{EXTERNAL_CONTENT_NOTICE}\n\n# Hello World\n\nSome content."
         mock_tavily.assert_awaited_once()
+
+    async def test_content_starts_with_origin_notice(
+        self, mock_tavily: AsyncMock, mock_safe_url: Any
+    ):
+        mock_tavily.return_value = {
+            "results": [
+                {
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "raw_content": "page text",
+                }
+            ]
+        }
+        result = await web_fetch_handler("sess_01TEST", {"url": "https://example.com"})
+        assert result["content"].startswith(EXTERNAL_CONTENT_NOTICE)
+        assert result["content"].endswith("page text")
 
     async def test_ssrf_blocked_url_returns_error(self, mock_tavily: AsyncMock, mock_safe_url: Any):
         mock_safe_url.return_value = False
@@ -79,6 +95,7 @@ class TestWebFetchHandler:
         }
         result = await web_fetch_handler("sess_01TEST", {"url": "https://example.com"})
         assert len(result["content"]) == 100_000
+        assert result["content"].startswith(EXTERNAL_CONTENT_NOTICE)
 
     async def test_falls_back_to_content_field(self, mock_tavily: AsyncMock, mock_safe_url: Any):
         mock_tavily.return_value = {
@@ -92,4 +109,4 @@ class TestWebFetchHandler:
             ]
         }
         result = await web_fetch_handler("sess_01TEST", {"url": "https://example.com"})
-        assert result["content"] == "fallback content"
+        assert result["content"] == f"{EXTERNAL_CONTENT_NOTICE}\n\nfallback content"

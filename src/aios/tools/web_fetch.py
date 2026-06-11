@@ -4,6 +4,8 @@ Uses Tavily's /extract endpoint for HTML-to-markdown conversion.
 SSRF protection blocks private/internal URLs.
 
 Return shape: {"url": "...", "title": "...", "content": "markdown..."}
+The content string starts with EXTERNAL_CONTENT_NOTICE marking it as
+quoted external page text.
 On error: {"error": "..."}
 """
 
@@ -15,7 +17,7 @@ import httpx
 
 from aios.errors import AiosError
 from aios.tools.registry import registry
-from aios.tools.tavily import WebToolError, tavily_request
+from aios.tools.tavily import EXTERNAL_CONTENT_NOTICE, WebToolError, tavily_request
 from aios.tools.url_safety import is_safe_url
 
 
@@ -57,7 +59,7 @@ async def web_fetch_handler(session_id: str, arguments: dict[str, Any]) -> dict[
         response = await tavily_request("extract", {"urls": [url]})
         result = response["results"][0]
         content = result.get("raw_content", "") or result.get("content", "")
-        content = content[:_MAX_CONTENT_CHARS]
+        content = f"{EXTERNAL_CONTENT_NOTICE}\n\n{content}"[:_MAX_CONTENT_CHARS]
         return {"url": url, "title": result.get("title", ""), "content": content}
     except WebToolError:
         raise

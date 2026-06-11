@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from aios.tools.tavily import WebToolError
+from aios.tools.tavily import EXTERNAL_CONTENT_NOTICE, WebToolError
 from aios.tools.web_search import WebSearchArgumentError, web_search_handler
 
 
@@ -34,6 +34,16 @@ class TestWebSearchHandler:
         assert result["results"][0]["title"] == "Result 1"
         assert result["results"][0]["url"] == "https://example.com/1"
         assert result["results"][0]["description"] == "Description 1"
+
+    async def test_result_includes_origin_notice(self, mock_tavily: AsyncMock):
+        mock_tavily.return_value = _CANNED_RESPONSE
+        result = await web_search_handler("sess_01TEST", {"query": "python testing"})
+        assert result["notice"] == EXTERNAL_CONTENT_NOTICE
+        assert result["results"][1] == {
+            "title": "Result 2",
+            "url": "https://example.com/2",
+            "description": "Description 2",
+        }
 
     async def test_missing_query_raises(self):
         with pytest.raises(WebSearchArgumentError):

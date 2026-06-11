@@ -3,7 +3,9 @@
 Uses Tavily's /search endpoint. Returns a list of results with
 title, URL, and description.
 
-Return shape: {"results": [{"title": "...", "url": "...", "description": "..."}]}
+Return shape: {"notice": "...", "results": [{"title": "...", "url": "...", "description": "..."}]}
+The notice field is EXTERNAL_CONTENT_NOTICE marking the result
+descriptions as quoted external page text.
 On error: {"error": "..."}
 """
 
@@ -15,7 +17,7 @@ import httpx
 
 from aios.errors import AiosError
 from aios.tools.registry import registry
-from aios.tools.tavily import WebToolError, tavily_request
+from aios.tools.tavily import EXTERNAL_CONTENT_NOTICE, WebToolError, tavily_request
 
 _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 20
@@ -70,7 +72,7 @@ async def web_search_handler(session_id: str, arguments: dict[str, Any]) -> dict
             }
             for r in response["results"]
         ]
-        return {"results": normalized}
+        return {"notice": EXTERNAL_CONTENT_NOTICE, "results": normalized}
     except WebToolError:
         raise
     except httpx.HTTPStatusError as exc:
