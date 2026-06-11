@@ -15,7 +15,7 @@ mkdir -p ~/.aios/instances/default
 mv ~/.aios/connectors ~/.aios/instances/default/connectors
 ```
 
-`aios dev bootstrap` writes `AIOS_CONNECTORS_DIR=~/.aios/instances/<id>/connectors`
-into the per-worktree `.env` automatically — dev instances cloister without
-operator action. Operators that explicitly set `AIOS_CONNECTORS_DIR` keep their
-override (escape hatch for ops that pre-bake connector state elsewhere).
+(Historical note: the `AIOS_CONNECTORS_DIR` env var from this era no longer
+exists — connectors now run as separate processes/containers authenticated by
+per-connection runtime tokens, and each manages its own state directory. See
+the per-connector READMEs and `compose.yml`.)

@@ -1,4 +1,4 @@
-"""Symmetric encryption box using libsodium SecretBox (XChaCha20-Poly1305 + Poly1305 MAC).
+"""Symmetric encryption box using libsodium SecretBox (XSalsa20-Poly1305).
 
 The aios server holds a single 32-byte master key in the ``AIOS_VAULT_KEY`` env
 var (base64-encoded). Every *active* encrypted row stores a randomly-generated

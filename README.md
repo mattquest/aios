@@ -91,7 +91,7 @@ Connections start in `detached` mode after creation; `attach` or `configure-per-
 
 ### Memory stores
 
-Encrypted, versioned key-value memory bound to sessions. Mounted into the sandbox at `/memory/<store-name>/`; tool writes go through an intercept that produces immutable `memory_versions` rows so memory survives session re-materialization. Multiple sessions can share a store; updates create new versions, never overwrite.
+Versioned key-value memory bound to sessions (content is stored as plaintext rows — see [docs/DATA-HANDLING.md](docs/DATA-HANDLING.md)). Mounted into the sandbox at `/mnt/memory/<store-name>/`; tool writes go through an intercept that produces immutable `memory_versions` rows so memory survives session re-materialization. Multiple sessions can share a store; updates create new versions, never overwrite.
 
 ### Agent versioning
 
@@ -413,14 +413,21 @@ All aios settings use the `AIOS_` prefix (Pydantic settings):
 | `AIOS_INSTANCE_ID` | Distinguishes concurrent deployments on a shared host (e.g. dev worktrees) |
 | `AIOS_DOCKER_IMAGE` | Sandbox image (default `ghcr.io/eumemic/aios-sandbox:latest`) |
 | `AIOS_WORKSPACE_ROOT` | Host directory bind-mounted as `/workspace` per session |
-| `AIOS_SANDBOX_NETWORK_MODE` | `bridge` / `none` / `host` |
 | `AIOS_WORKER_CONCURRENCY` | Concurrent session steps per worker (default 4) |
-| `AIOS_CONNECTORS_ENABLED` | CSV of `<connector>[:<instance>]` entries the worker should spawn |
-| `AIOS_CONNECTORS_DIR` | Where connector spool DBs / state live (defaults to `~/.aios/instances/<instance_id>/connectors`) |
+| `AIOS_API_RATE_LIMIT_PER_MINUTE` | Per-client API request ceiling (default 1200; `0` disables). Keyed per bearer token, client IP when unauthenticated; health and stream endpoints exempt. |
 | `AIOS_DEFAULT_MCP_PERMISSION_POLICY` | Fallback for unmounted MCP toolsets (`always_allow` / `always_ask`) |
 | `AIOS_TAVILY_API_KEY` | Web tools |
 
 Model provider keys use standard LiteLLM env vars (no `AIOS_` prefix): `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.
+
+## Security & data handling
+
+[SECURITY.md](SECURITY.md) documents the trust boundaries, defaults, how
+untrusted content is handled, known limitations, and an operator hardening
+checklist. [docs/DATA-HANDLING.md](docs/DATA-HANDLING.md) documents what is
+stored where, what leaves the host, and what the operator is responsible
+for. [docs/PORTABILITY.md](docs/PORTABILITY.md) covers export/import,
+backups, and upgrades.
 
 ## Divergences from Anthropic Managed Agents
 
