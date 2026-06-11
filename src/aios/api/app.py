@@ -27,6 +27,7 @@ from aios.api.routers import (
     session_templates,
     sessions,
     skills,
+    usage,
     vaults,
 )
 from aios.config import get_settings
@@ -100,6 +101,7 @@ def create_app() -> FastAPI:
     app.include_router(runtime_tokens.router)
     app.include_router(connectors.router)
     app.include_router(session_templates.router)
+    app.include_router(usage.router)
     _mount_mcp(app)
     return app
 

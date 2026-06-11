@@ -8228,6 +8228,105 @@
           }
         }
       }
+    },
+    "/v1/usage": {
+      "get": {
+        "tags": [
+          "usage"
+        ],
+        "summary": "Get Usage",
+        "description": "Aggregate per-request model usage for the caller's account.\n\nSums the token counts stamped on successful ``model_request_end``\nspan events, bucketed per UTC day, per session, or per model. The\nwindow is ``since <= created_at < until``; either bound may be\nomitted. Token sums are always reported; ``cost_usd_known`` covers\nonly the requests whose provider/LiteLLM reported a cost \u2014 the rest\nare counted in ``cost_usd_estimated_null_requests``, never priced.",
+        "operationId": "get_usage",
+        "parameters": [
+          {
+            "name": "granularity",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "day",
+                "session",
+                "model"
+              ],
+              "type": "string",
+              "default": "day",
+              "title": "Granularity"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          },
+          {
+            "name": "Authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageReport"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -13551,6 +13650,119 @@
         "type": "object",
         "title": "UpdateAccountRequest",
         "description": "Body for ``PATCH /v1/accounts/{id}``.\n\nPartial update: omitted fields are preserved. Both fields are\noptional; at least one must be non-null. Submitting both as null\nis a no-op that returns the account row unchanged."
+      },
+      "UsageReport": {
+        "properties": {
+          "granularity": {
+            "type": "string",
+            "enum": [
+              "day",
+              "session",
+              "model"
+            ],
+            "title": "Granularity"
+          },
+          "since": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since"
+          },
+          "until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Until"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          }
+        },
+        "type": "object",
+        "required": [
+          "granularity",
+          "since",
+          "until",
+          "rows"
+        ],
+        "title": "UsageReport",
+        "description": "Payload of ``GET /v1/usage``. Echoes the resolved filter window."
+      },
+      "UsageRow": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "session_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Title"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "title": "Output Tokens"
+          },
+          "cache_read_tokens": {
+            "type": "integer",
+            "title": "Cache Read Tokens"
+          },
+          "cache_creation_tokens": {
+            "type": "integer",
+            "title": "Cache Creation Tokens"
+          },
+          "requests": {
+            "type": "integer",
+            "title": "Requests"
+          },
+          "cost_usd_known": {
+            "type": "number",
+            "title": "Cost Usd Known"
+          },
+          "cost_usd_estimated_null_requests": {
+            "type": "integer",
+            "title": "Cost Usd Estimated Null Requests"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_tokens",
+          "cache_creation_tokens",
+          "requests",
+          "cost_usd_known",
+          "cost_usd_estimated_null_requests"
+        ],
+        "title": "UsageRow",
+        "description": "One aggregation bucket.\n\n``key`` is the bucket identity: a UTC calendar date (``YYYY-MM-DD``)\nfor ``day``, a session id for ``session``, or the raw model string\nfor ``model`` (the literal ``unknown`` for historical spans stamped\nbefore the ``model`` field existed)."
       },
       "ValidationError": {
         "properties": {

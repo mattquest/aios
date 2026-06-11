@@ -79,6 +79,7 @@ from aios.models.scheduled_tasks import (
 from aios.models.session_templates import SessionTemplate
 from aios.models.sessions import Session, SessionStatus, SessionUsage
 from aios.models.skills import AgentSkillRef, Skill, SkillVersion
+from aios.models.usage import UsageRow
 from aios.models.vaults import AuthType, Vault, VaultCredential
 
 
@@ -1812,6 +1813,139 @@ async def model_token_ratio(
         ratio,
     )
     return ratio
+
+
+# Bucket-key SELECT expressions per usage granularity. ``day`` buckets on
+# the UTC calendar date of the span's arrival; ``model`` falls back to the
+# literal 'unknown' for historical success spans stamped before
+# harness/loop.py recorded the ``model`` field — their tokens are real and
+# must not be silently dropped.
+_USAGE_KEY_EXPRS: dict[str, str] = {
+    "day": "to_char(e.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')",
+    "session": "e.session_id",
+    "model": "COALESCE(e.data->>'model', 'unknown')",
+}
+
+
+def build_usage_query(
+    granularity: str,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+) -> tuple[str, list[Any]]:
+    """Build the usage-aggregation SQL + positional params (minus account_id).
+
+    Pure function so the shaping is unit-testable without Postgres. The
+    returned SQL takes ``account_id`` as ``$1``; ``since``/``until`` are
+    appended as ``$2``/``$3`` only when provided, and the returned params
+    list contains exactly those extra values in order.
+
+    Aggregates successful ``model_request_end`` spans only — the error
+    branch stamps ``model_usage: {}`` and ``cost_usd: null`` (no tokens,
+    no reported cost), so including it would only inflate the
+    unknown-cost request count. The WHERE clause is written to match the
+    ``events_model_request_end_usage_idx`` partial index (migration 0067)
+    predicate verbatim so the planner can use it.
+
+    Cost honesty: ``cost_usd_known`` sums only rows whose ``cost_usd``
+    is present and non-null (``data->>'cost_usd'`` is NULL for both JSON
+    null and an absent key); every other row is counted in
+    ``cost_usd_estimated_null_requests`` instead of being priced.
+    """
+    key_expr = _USAGE_KEY_EXPRS.get(granularity)
+    if key_expr is None:
+        raise ValidationError(
+            f"unknown granularity {granularity!r}; expected day, session, or model"
+        )
+
+    params: list[Any] = []
+    where = [
+        "e.kind = 'span'",
+        "e.data->>'event' = 'model_request_end'",
+        "(e.data->>'is_error')::boolean = false",
+        "e.account_id = $1",
+    ]
+    if since is not None:
+        params.append(since)
+        where.append(f"e.created_at >= ${len(params) + 1}")
+    if until is not None:
+        params.append(until)
+        where.append(f"e.created_at < ${len(params) + 1}")
+
+    if granularity == "session":
+        title_expr = "s.title"
+        join = "JOIN sessions s ON s.id = e.session_id"
+    else:
+        title_expr = "NULL::text"
+        join = ""
+
+    # ``day`` reads chronologically; ``session``/``model`` read biggest
+    # consumer first (input_tokens is the full prompt count including the
+    # cache breakdown fields, so input+output is the request total).
+    # Output-column aliases can't appear inside an ORDER BY *expression*
+    # (only bare), so the token sums are repeated verbatim.
+    token_total = (
+        "(COALESCE(SUM((e.data->'model_usage'->>'input_tokens')::bigint), 0)"
+        " + COALESCE(SUM((e.data->'model_usage'->>'output_tokens')::bigint), 0))"
+    )
+    order = "key" if granularity == "day" else f"{token_total} DESC, key"
+
+    sql = f"""
+        SELECT
+            {key_expr} AS key,
+            {title_expr} AS session_title,
+            COALESCE(SUM((e.data->'model_usage'->>'input_tokens')::bigint), 0)
+                AS input_tokens,
+            COALESCE(SUM((e.data->'model_usage'->>'output_tokens')::bigint), 0)
+                AS output_tokens,
+            COALESCE(SUM((e.data->'model_usage'->>'cache_read_input_tokens')::bigint), 0)
+                AS cache_read_tokens,
+            COALESCE(SUM((e.data->'model_usage'->>'cache_creation_input_tokens')::bigint), 0)
+                AS cache_creation_tokens,
+            COUNT(*)::bigint AS requests,
+            COALESCE(SUM((e.data->>'cost_usd')::float)
+                FILTER (WHERE e.data->>'cost_usd' IS NOT NULL), 0)::float
+                AS cost_usd_known,
+            (COUNT(*) FILTER (WHERE e.data->>'cost_usd' IS NULL))::bigint
+                AS cost_usd_estimated_null_requests
+        FROM events e
+        {join}
+        WHERE {" AND ".join(where)}
+        GROUP BY 1, 2
+        ORDER BY {order}
+    """
+    return sql, params
+
+
+async def aggregate_model_usage(
+    conn: asyncpg.Connection[Any],
+    granularity: str,
+    *,
+    account_id: str,
+    since: datetime | None,
+    until: datetime | None,
+) -> list[UsageRow]:
+    """Aggregate ``model_request_end`` spans into :class:`UsageRow` buckets.
+
+    On-demand operator query (``GET /v1/usage``), not a hot path. Served
+    by the ``events_model_request_end_usage_idx`` partial index.
+    """
+    sql, params = build_usage_query(granularity, since=since, until=until)
+    rows = await conn.fetch(sql, account_id, *params)
+    return [
+        UsageRow(
+            key=r["key"],
+            session_title=r["session_title"],
+            input_tokens=r["input_tokens"],
+            output_tokens=r["output_tokens"],
+            cache_read_tokens=r["cache_read_tokens"],
+            cache_creation_tokens=r["cache_creation_tokens"],
+            requests=r["requests"],
+            cost_usd_known=r["cost_usd_known"],
+            cost_usd_estimated_null_requests=r["cost_usd_estimated_null_requests"],
+        )
+        for r in rows
+    ]
 
 
 def _derive_tool_name(kind: str, data: dict[str, Any]) -> str | None:
