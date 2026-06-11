@@ -58,12 +58,13 @@ from aios.sandbox.tool_broker import ToolBroker
 # computes the same lock number across old and new workers.
 _WORKER_SINGLETON_LOCK_KEY_TEXT = "aios_worker_connector_supervisor"
 
-# Path the worker touches periodically to signal liveness; the Dockerfile
-# HEALTHCHECK reads its mtime. tmpfs in containers, so touch/unlink are
-# sub-microsecond and don't justify ``asyncio.to_thread`` (which would
+# The worker touches ``settings.worker_heartbeat_file`` periodically to
+# signal liveness; the Dockerfile HEALTHCHECK reads its mtime (pinned to
+# /var/run/aios-worker-alive via env in the image — the bare-metal default
+# lives under the platform tempdir). tmpfs in containers, so touch/unlink
+# are sub-microsecond and don't justify ``asyncio.to_thread`` (which would
 # add more latency than it saves) — that's why the call sites suppress
 # the async-blocking-pathlib lint with a per-line ignore.
-_HEARTBEAT_FILE = Path("/var/run/aios-worker-alive")
 _HEARTBEAT_INTERVAL_SECONDS = 15
 
 
@@ -207,9 +208,12 @@ async def worker_main() -> None:
         # operational. Touch once now for an immediate green signal,
         # then the task takes over the periodic refresh.
         with contextlib.suppress(OSError):
-            _HEARTBEAT_FILE.touch()  # noqa: ASYNC240
+            settings.worker_heartbeat_file.touch()
         heartbeat_task = asyncio.create_task(
-            _periodic_heartbeat(interval=_HEARTBEAT_INTERVAL_SECONDS),
+            _periodic_heartbeat(
+                path=settings.worker_heartbeat_file,
+                interval=_HEARTBEAT_INTERVAL_SECONDS,
+            ),
             name="heartbeat",
         )
 
@@ -226,7 +230,7 @@ async def worker_main() -> None:
         # (Coolify, k8s) get the right liveness signal during the
         # potentially-slow drain that follows.
         with contextlib.suppress(OSError):
-            _HEARTBEAT_FILE.unlink(missing_ok=True)  # noqa: ASYNC240
+            settings.worker_heartbeat_file.unlink(missing_ok=True)
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -324,7 +328,7 @@ async def _acquire_worker_lock(
         raise
 
 
-async def _periodic_heartbeat(*, interval: int = _HEARTBEAT_INTERVAL_SECONDS) -> None:
+async def _periodic_heartbeat(*, path: Path, interval: int = _HEARTBEAT_INTERVAL_SECONDS) -> None:
     """Background task: touch the heartbeat file so the container's
     HEALTHCHECK can detect a hung or crashed worker.
 
@@ -334,17 +338,27 @@ async def _periodic_heartbeat(*, interval: int = _HEARTBEAT_INTERVAL_SECONDS) ->
     (lock contention, pool DNS failure, etc.) does NOT touch the file
     and thus reports unhealthy after the threshold elapses, which is
     the behavior we want.
+
+    An unwritable path (permission denied, missing tmpfs) is a
+    deployment property, not a transient glitch — it logs ONE warning
+    and ends the task instead of repeating the warning every interval
+    forever. Worker liveness stays observable either way through
+    procrastinate's DB heartbeat (``procrastinate_workers.last_heartbeat``,
+    the source ``reap_stalled_jobs`` already uses).
     """
     log = get_logger("aios.worker.heartbeat")
     while True:
         try:
-            _HEARTBEAT_FILE.touch()  # noqa: ASYNC240
+            path.touch()  # noqa: ASYNC240
         except OSError as e:
-            # tmpfs unavailable / permission denied — surface but don't
-            # crash the worker; a missing heartbeat file simply means
-            # the healthcheck reports unhealthy, which an operator
-            # can investigate.
-            log.warning("heartbeat.touch_failed", path=str(_HEARTBEAT_FILE), error=str(e))
+            log.warning(
+                "heartbeat.touch_failed",
+                path=str(path),
+                error=str(e),
+                disabled=True,
+                hint="file heartbeat disabled; the procrastinate DB heartbeat remains",
+            )
+            return
         await asyncio.sleep(interval)
 
 

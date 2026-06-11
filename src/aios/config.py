@@ -7,6 +7,7 @@ rather than touching ``os.environ`` directly.
 
 from __future__ import annotations
 
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -212,6 +213,16 @@ class Settings(BaseSettings):
         default=4,
         ge=1,
         description="Concurrent session steps per worker process.",
+    )
+    worker_heartbeat_file: Path = Field(
+        default_factory=lambda: Path(tempfile.gettempdir()) / "aios-worker-alive",
+        description=(
+            "File the worker touches every 15s to signal liveness; the "
+            "container HEALTHCHECK reads its mtime (the Dockerfile pins it "
+            "to /var/run/aios-worker-alive via env). Defaults under the "
+            "platform tempdir so bare-metal deploys never hit permission "
+            "errors."
+        ),
     )
 
     # ── container lifecycle ────────────────────────────────────────────────

@@ -95,6 +95,11 @@ FROM base AS worker
 # of 60 s covers worst-case startup (the 30 s lock-wait + ~5 s of pool
 # / procrastinate setup) — the orchestrator won't kill the container
 # while it's still legitimately booting.
+#
+# The path is configurable (AIOS_WORKER_HEARTBEAT_FILE; bare-metal
+# default = the platform tempdir); pin it here so the HEALTHCHECK and
+# the worker always agree inside the image.
+ENV AIOS_WORKER_HEARTBEAT_FILE=/var/run/aios-worker-alive
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD test "$(stat -c %Y /var/run/aios-worker-alive 2>/dev/null || echo 0)" -gt $(($(date +%s) - 60))
 
