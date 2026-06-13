@@ -334,7 +334,8 @@ class TestNoCorrelatedSubplanOverEvents:
         assert not found, (
             f"N+1 regression in errored-session derivation: "
             f"{len(found)} correlated subplan(s) over events. This query must "
-            f"hoist MAX(seq) per session via CTEs (see session_max_reacting)."
+            f"hoist MAX(seq) per session via CTEs "
+            f"(see session_floor / session_channel_handled)."
         )
 
     async def test_span_start_rows_is_not_n_plus_1(self, seeded_pool: asyncpg.Pool[Any]) -> None:

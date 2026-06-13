@@ -723,3 +723,342 @@ class TestSweepWaking:
         # Cleanup.
         tool_proceed.set()
         await harness.wait_for_tools(session.id)
+
+
+# ─── per-channel wake watermark (handled marker) ─────────────────────────────
+
+
+_ACCT = "acc_test_stub"
+
+
+async def _append_assistant(
+    harness: Harness,
+    session_id: str,
+    *,
+    reacting_to: int,
+    handled: dict[str, Any] | None,
+) -> None:
+    """Append an assistant message carrying ``reacting_to`` and, optionally,
+    the new ``handled`` marker.  ``handled=None`` writes an OLD-FORMAT
+    message (reacting_to only) for the backward-compat fixture."""
+    data: dict[str, Any] = {"role": "assistant", "content": "ok", "reacting_to": reacting_to}
+    if handled is not None:
+        data["handled"] = handled
+    await sessions_service.append_event(
+        harness._pool, session_id, "message", data, account_id=_ACCT
+    )
+
+
+async def _append_channel_user(harness: Harness, session_id: str, channel: str, text: str) -> int:
+    """Append a user message on ``channel`` (sets the derived ``channel``
+    column via ``orig_channel``).  Returns its seq."""
+    evt = await sessions_service.append_user_message(
+        harness._pool, session_id, text, metadata={"channel": channel}, account_id=_ACCT
+    )
+    return evt.seq
+
+
+@needs_docker
+class TestPerChannelWakeWatermark:
+    """The wake gate reads the per-channel ``handled`` marker, not the single
+    global ``reacting_to`` scalar — so a reply delivered to one channel no
+    longer marks a co-pending message on another channel handled (the audit
+    defect), while ordinary declined chatter still does not re-wake forever.
+    """
+
+    async def test_old_format_messages_match_old_behavior(self, harness: Harness) -> None:
+        """Backward compat: with ZERO new-format ``handled`` markers, the gate
+        must wake exactly when the old ``MAX(reacting_to)`` rule did.
+
+        Old rule: an event is unhandled iff its seq > MAX(reacting_to).  Here
+        the assistant reacted to seq 2 (reacting_to=2) but a later user event
+        at seq 3 is unreacted → the session wakes; after the assistant reacts
+        to seq 3, nothing is unhandled → it does not wake.
+        """
+        harness.script_model([])
+        session = await harness.start("hello")  # user seq 1
+        # Assistant reacts to seq 1 — OLD FORMAT (no handled marker).
+        await _append_assistant(harness, session.id, reacting_to=1, handled=None)
+        # Nothing unreacted → not woken (== old behavior).
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs
+
+        # New user message at seq 3 (channel-less, like the console/API path).
+        await harness.inject_message(session.id, "again")
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs, "unreacted event above the old watermark must wake"
+
+        # Assistant reacts to it — still OLD FORMAT.
+        await _append_assistant(harness, session.id, reacting_to=3, handled=None)
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs, "old-format reacting_to must close the wake"
+
+    async def test_old_format_channel_bearing_event_matches_old_behavior(
+        self, harness: Harness
+    ) -> None:
+        """Backward compat for a CHANNEL-BEARING event: with ZERO new-format
+        ``handled`` markers, a channel user message wakes/settles exactly as the
+        old global ``MAX(reacting_to)`` scalar would.
+
+        Old-format assistant messages contribute COALESCE(reacting_to, seq) to
+        the global floor only (the CASE ELSE branch) and nothing per-channel, so
+        a channel event at seq 2 is unhandled while MAX(reacting_to) < 2 and
+        handled once an old-format reply reacts to seq 2 — the channel column is
+        irrelevant when there is no per-channel watermark.
+        """
+        harness.script_model([])
+        session = await harness.start("seed")  # channel-less user seq 1
+        # Assistant reacts to seq 1 — OLD FORMAT (no handled marker).
+        await _append_assistant(harness, session.id, reacting_to=1, handled=None)
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs
+
+        # A channel-bearing user message at seq 3 (assistant reply was seq 2).
+        await _append_channel_user(harness, session.id, "signal/bot/dm", "operator: ping")
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs, (
+            "a channel event above the old global watermark must wake even with "
+            "only old-format markers (no per-channel watermark exists yet)"
+        )
+
+        # Assistant reacts to the channel event — still OLD FORMAT, channel-less
+        # reply.  It contributes to the global floor (CASE ELSE), which covers
+        # the channel event exactly as the old scalar rule did.
+        last_seq = (await harness.session(session.id)).last_event_seq
+        await _append_assistant(harness, session.id, reacting_to=last_seq, handled=None)
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs, (
+            "an old-format reply advancing the global floor over a channel event "
+            "settles it (channel column irrelevant without a per-channel marker)"
+        )
+
+    async def test_active_expr_and_gate_agree_on_copending_channel(self, harness: Harness) -> None:
+        """``_SESSION_ACTIVE_EXPR`` (derived session status, the clone gate) and
+        the sweep wake gate must AGREE: a session with a co-pending
+        other-channel stimulus that the gate wakes for must also read as
+        ``active`` (status), so the clone gate does not treat it as settled.
+
+        Pre-fix divergence: the expr used the old global ``MAX(reacting_to)``
+        scalar, so a channel-G message below a channel-D reply's reacting_to
+        watermark was woken by the sweep but reported ``idle`` by the expr.
+        """
+        harness.script_model([])
+        session = await harness.start("seed")  # channel-less user seq 1
+        await _append_assistant(
+            harness, session.id, reacting_to=1, handled={"scope": "all", "seq": 1}
+        )
+
+        # Group (channel G) then DM (channel D) both pending.
+        await _append_channel_user(harness, session.id, "signal/bot/group", "family chatter")
+        dm_seq = await _append_channel_user(harness, session.id, "signal/bot/dm", "operator: ping")
+
+        # Channel-scoped reply on D up to the DM's seq — the OLD scalar rule
+        # would have wrongly covered the group message (seq < dm_seq) too.
+        await _append_assistant(
+            harness,
+            session.id,
+            reacting_to=dm_seq,
+            handled={"scope": "channel", "channel": "signal/bot/dm", "seq": dm_seq},
+        )
+
+        # The gate wakes for the still-live group channel...
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs
+
+        # ...and the expr (via derived status) MUST agree it is active.
+        status = (await harness.session(session.id)).status
+        assert status == "active", (
+            "_SESSION_ACTIVE_EXPR must agree with the wake gate: a co-pending "
+            "other-channel stimulus is owed work, so the session is active "
+            "(else the clone gate would treat it as settled)"
+        )
+
+        # Once both channels are handled, gate and expr agree it is idle.
+        await _append_assistant(
+            harness,
+            session.id,
+            reacting_to=dm_seq,
+            handled={"scope": "channel", "channel": "signal/bot/group", "seq": dm_seq},
+        )
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs
+        status = (await harness.session(session.id)).status
+        assert status == "idle", "both channels handled → gate and expr both settle"
+
+    async def test_audit_scenario_dm_answered_group_rewakes(self, harness: Harness) -> None:
+        """The exact audit defect: a group message (channel G) and a DM
+        (channel D) are both pending; the model switches focal to D and
+        delivers a reply (channel-scoped handled D).  The group message has no
+        channel-D coverage and the global floor is unchanged, so it stays
+        unhandled and the session re-wakes for the group.
+        """
+        harness.script_model([])
+        session = await harness.start("seed")  # channel-less user seq 1
+        # Assistant handles the seed (decline-all up to seq 1).
+        await _append_assistant(
+            harness, session.id, reacting_to=1, handled={"scope": "all", "seq": 1}
+        )
+
+        # Group message (seq 2) then DM (seq 3) both arrive, both pending.
+        await _append_channel_user(harness, session.id, "signal/bot/group", "family chatter")
+        dm_seq = await _append_channel_user(harness, session.id, "signal/bot/dm", "operator: ping")
+
+        # Both are unhandled → the session needs inference.
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs
+
+        # Model switches focal to D and delivers a reply: channel-scoped on D
+        # up to the max stimulus it saw (the DM's seq).  The group seq is NOT
+        # covered and the global floor stays at 1.
+        await _append_assistant(
+            harness,
+            session.id,
+            reacting_to=dm_seq,
+            handled={"scope": "channel", "channel": "signal/bot/dm", "seq": dm_seq},
+        )
+
+        # The DM is handled, but the GROUP message must still re-wake the
+        # session — this is the bug the change fixes.
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs, (
+            "group message on channel G must re-wake: a channel-scoped DM reply "
+            "leaves other channels live (the audit defect)"
+        )
+
+        # Now the model switches to G and replies there (channel-scoped on G).
+        await _append_assistant(
+            harness,
+            session.id,
+            reacting_to=dm_seq,
+            handled={"scope": "channel", "channel": "signal/bot/group", "seq": dm_seq},
+        )
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs, "both channels handled → no further wake"
+
+    async def test_decline_all_advances_global_floor_no_storm(self, harness: Harness) -> None:
+        """A busy group the model keeps stay_silent-ing must not loop: a
+        decline-all marker advances the global floor over the declined
+        chatter, so it is handled on ANY channel.
+        """
+        harness.script_model([])
+        session = await harness.start("seed")  # channel-less seq 1
+        await _append_assistant(
+            harness, session.id, reacting_to=1, handled={"scope": "all", "seq": 1}
+        )
+
+        # A burst of group chatter (seq 2, 3, 4).
+        await _append_channel_user(harness, session.id, "signal/bot/group", "msg a")
+        await _append_channel_user(harness, session.id, "signal/bot/group", "msg b")
+        last = await _append_channel_user(harness, session.id, "signal/bot/group", "msg c")
+
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs
+
+        # Model stays silent: decline-all up to the max stimulus seq.
+        await _append_assistant(
+            harness, session.id, reacting_to=last, handled={"scope": "all", "seq": last}
+        )
+
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs, (
+            "declined chatter must not re-wake — a stay_silent decline-all "
+            "advances the global floor over every channel"
+        )
+
+    async def test_channel_scoped_reply_leaves_other_channels_live(self, harness: Harness) -> None:
+        """A channel-scoped reply on D leaves a co-pending message on G live,
+        but a SECOND message on D below D's watermark stays handled.
+        """
+        harness.script_model([])
+        session = await harness.start("seed")
+        await _append_assistant(
+            harness, session.id, reacting_to=1, handled={"scope": "all", "seq": 1}
+        )
+
+        # DM messages (seq 2, 3) and one group message (seq 4).
+        await _append_channel_user(harness, session.id, "signal/bot/dm", "dm 1")
+        dm2 = await _append_channel_user(harness, session.id, "signal/bot/dm", "dm 2")
+        await _append_channel_user(harness, session.id, "signal/bot/group", "group 1")
+
+        # Reply delivered to D up to dm2's seq — handles both DM messages
+        # (seq 2 and 3 <= dm2) but NOT the group (seq 4).
+        await _append_assistant(
+            harness,
+            session.id,
+            reacting_to=dm2,
+            handled={"scope": "channel", "channel": "signal/bot/dm", "seq": dm2},
+        )
+
+        # The group message keeps the session live; were the gate scalar it
+        # would be wrongly covered by reacting_to=dm2.
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs
+
+    async def test_channel_less_stimulus_uses_global_floor(self, harness: Harness) -> None:
+        """A channel-less event (self-wake / console / operator) is gated by
+        the GLOBAL floor alone — a channel-scoped reply does NOT cover it.
+        """
+        harness.script_model([])
+        session = await harness.start("seed")
+        await _append_assistant(
+            harness, session.id, reacting_to=1, handled={"scope": "all", "seq": 1}
+        )
+
+        # A channel-less user event (no channel metadata).
+        cl_evt = await sessions_service.append_user_message(
+            harness._pool, session.id, "operator console message", account_id=_ACCT
+        )
+        cl_seq = cl_evt.seq
+
+        # A channel-scoped reply on D up to the channel-less event's seq must
+        # NOT cover it (the gate checks channel-less events against the global
+        # floor, which is still 1).
+        await _append_assistant(
+            harness,
+            session.id,
+            reacting_to=cl_seq,
+            handled={"scope": "channel", "channel": "signal/bot/dm", "seq": cl_seq},
+        )
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs, (
+            "a channel-less event must re-wake under a channel-scoped reply — "
+            "it is gated by the global floor, not any per-channel watermark"
+        )
+
+        # A decline-all up to the channel-less event's seq finally clears it.
+        await _append_assistant(
+            harness, session.id, reacting_to=cl_seq, handled={"scope": "all", "seq": cl_seq}
+        )
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs
+
+    async def test_reply_then_stay_silent_clears_deferred_channel(self, harness: Harness) -> None:
+        """A reply on D (deferring G), followed by a stay_silent next step,
+        clears the deferred group channel via the global floor.
+        """
+        harness.script_model([])
+        session = await harness.start("seed")
+        await _append_assistant(
+            harness, session.id, reacting_to=1, handled={"scope": "all", "seq": 1}
+        )
+
+        await _append_channel_user(harness, session.id, "signal/bot/group", "group ping")
+        dm = await _append_channel_user(harness, session.id, "signal/bot/dm", "dm ping")
+
+        # Step 1: reply to D — defers G.
+        await _append_assistant(
+            harness,
+            session.id,
+            reacting_to=dm,
+            handled={"scope": "channel", "channel": "signal/bot/dm", "seq": dm},
+        )
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs  # G still live
+
+        # Step 2: the re-wake fires the model, which decides the group needs
+        # nothing and stays silent — decline-all advances the global floor.
+        await _append_assistant(
+            harness, session.id, reacting_to=dm, handled={"scope": "all", "seq": dm}
+        )
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs, "stay_silent decline-all clears the deferred channel"

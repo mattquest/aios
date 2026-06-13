@@ -785,8 +785,13 @@ async def list_agent_versions(
 # log — there is no persisted status column (#728-era status collapse). A
 # session is ``active`` when it has owed/in-flight work that will advance
 # WITHOUT a new unprompted user message:
-#   * an unreacted stimulus  — a non-assistant message event past the assistant
-#     ``reacting_to`` watermark (queued/generating/tool-completed-awaiting-step), OR
+#   * an unreacted stimulus  — a non-assistant message event the model has not
+#     handled, using the SAME per-channel watermark as the sweep wake gate
+#     (queued/generating/tool-completed-awaiting-step): an event on channel C is
+#     unhandled iff its seq exceeds GREATEST(decline-all global floor, channel
+#     C's per-channel handled seq); a channel-less event checks the global floor
+#     alone (mirrors ``sweep._SESSION_HANDLED_CTES`` — see the lock-step note on
+#     the first EXISTS below), OR
 #   * an unresolved tool_call — an assistant tool_call with no tool-role result
 #     (harness tool in-flight, or blocked on an approval/custom-tool result).
 # ...EXCEPT when ``errored`` (retry budget exhausted, not yet recovered): the
@@ -804,16 +809,45 @@ async def list_agent_versions(
 # ``_SESSION_ACTIVE_EXPR`` — has owed/in-flight work (unreacted stimulus OR
 # unresolved tool_call). ``_SESSION_ERRORED_EXPR`` — parked-errored latch
 # (also reused by ``lock_active_session_for_update`` and the clone gate).
+#
+# The first EXISTS (unreacted stimulus) MUST use the SAME per-channel
+# watermark the sweep wake gate uses (``sweep._SESSION_HANDLED_CTES`` /
+# ``CANDIDATE_ROWS_SQL``), or status display + the clone gate disagree with
+# what the sweep actually wakes+runs: a session with a co-pending other-channel
+# stimulus below the old global ``MAX(reacting_to)`` scalar is woken by the
+# sweep but would read ``idle`` here (and the clone gate would treat it as
+# settled). The gate expresses this with two hoisted CTEs because it scans
+# events cross-session and is perf-guarded against correlated SubPlans; this
+# expr is embedded inline (status list keyset pages + the clone gate's single
+# FOR UPDATE read), runs per-session on O(page) rows, and is NOT in that
+# guarded path — so the same logic is expressed here as CORRELATED SUBQUERIES.
+# Keep the two in lock-step: any change to the gate's handled-marker semantics
+# must be mirrored here (and vice-versa).
 _SESSION_ACTIVE_EXPR = """(
         EXISTS (
             SELECT 1 FROM events ev
              WHERE ev.session_id = sessions.id AND ev.account_id = sessions.account_id
                AND ev.kind = 'message' AND ev.role <> 'assistant'
-               AND ev.seq > COALESCE((
-                   SELECT MAX(COALESCE((ae.data->>'reacting_to')::bigint, ae.seq))
-                     FROM events ae
-                    WHERE ae.session_id = sessions.id AND ae.account_id = sessions.account_id
-                      AND ae.kind = 'message' AND ae.role = 'assistant'), 0))
+               AND ev.seq > GREATEST(
+                   COALESCE((
+                       SELECT MAX(CASE
+                                    WHEN ae.data->'handled'->>'scope' = 'all'
+                                      THEN (ae.data->'handled'->>'seq')::bigint
+                                    WHEN ae.data ? 'handled'
+                                      THEN NULL
+                                    ELSE COALESCE((ae.data->>'reacting_to')::bigint, ae.seq)
+                                  END)
+                         FROM events ae
+                        WHERE ae.session_id = sessions.id AND ae.account_id = sessions.account_id
+                          AND ae.kind = 'message' AND ae.role = 'assistant'), 0),
+                   CASE WHEN ev.channel IS NULL THEN 0 ELSE COALESCE((
+                       SELECT MAX((ce.data->'handled'->>'seq')::bigint)
+                         FROM events ce
+                        WHERE ce.session_id = sessions.id AND ce.account_id = sessions.account_id
+                          AND ce.kind = 'message' AND ce.role = 'assistant'
+                          AND ce.data->'handled'->>'scope' = 'channel'
+                          AND ce.data->'handled' ? 'channel'
+                          AND ce.data->'handled'->>'channel' = ev.channel), 0) END))
         OR EXISTS (
             SELECT 1 FROM events ate
              CROSS JOIN LATERAL jsonb_array_elements(ate.data->'tool_calls') tc

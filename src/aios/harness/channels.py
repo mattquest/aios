@@ -709,9 +709,13 @@ def suppress_bare_text_delivery(events: Iterable[Event], focal_channel: str | No
     channels.
 
     "New" means user-role message events with ``seq`` greater than the
-    previous assistant message's watermark —
-    ``MAX(COALESCE(reacting_to, seq))`` over assistant messages, the
-    same derivation ``find_sessions_needing_inference`` uses.
+    previous assistant message's watermark — ``MAX(COALESCE(reacting_to,
+    seq))`` over assistant messages. This is the GLOBAL ``reacting_to``
+    scalar (what the assistant last saw), which is the right horizon for
+    a delivery decision. Do NOT confuse it with the wake gate
+    (``find_sessions_needing_inference``), which since the per-channel
+    ``handled`` marker uses ``GREATEST(global_floor, channel_handled)``;
+    the two derivations are intentionally different and must stay so.
     Suppression requires ALL of: the new-stimulus set is non-empty,
     every event in it carries a channel (``orig_channel``), and none of
     those channels equals the focal channel.  Then bare assistant text
@@ -745,6 +749,86 @@ def suppress_bare_text_delivery(events: Iterable[Event], focal_channel: str | No
     if not new_user_events:
         return False
     return all(bool(e.orig_channel) and e.orig_channel != focal_channel for e in new_user_events)
+
+
+# ─── per-channel wake watermark (handled marker) ─────────────────────────────
+#
+# ``reacting_to`` is a single global scalar: the max seq the assistant saw in
+# context.  It drives the context builder's visibility horizon and stays
+# unchanged.  But it is the WRONG signal for the wake gate when one session
+# multiplexes several channels: stamping ``reacting_to = 11`` (a DM the model
+# answered) also covers a pending group message at seq 10 (10 < 11), so the
+# group message is marked handled and the session is never re-woken for it.
+#
+# The ``handled`` marker is a SEPARATE per-assistant-message field consumed
+# ONLY by the wake gate.  It records EITHER:
+#
+#   * decline-all  — ``{"scope": "all", "seq": N}``: the model attended to
+#     everything visible and is done this turn.  Advances a GLOBAL floor, so
+#     every channel up to seq N is handled.  Produced by a stay_silent turn, a
+#     suppressed-delivery turn (the reply was NOT delivered), a monologue-only
+#     turn, a tool-only turn, and a no-focal-channel turn — i.e. anything that
+#     delivered nothing requiring follow-up to a specific channel.
+#   * channel-scoped — ``{"scope": "channel", "channel": C, "seq": N}``: the
+#     model DELIVERED a reply to its focal channel C.  Handles channel C (and
+#     channel-less events) up to seq N, but leaves OTHER channels live so a
+#     co-pending message on a different channel still re-wakes the session.
+#
+# ``N`` is always ``reacting_to`` (the max-stimulus seq the response saw).  For
+# decline-all this makes the global floor advance to exactly today's
+# ``MAX(reacting_to)`` — see the backward-compat note in
+# ``sweep.CANDIDATE_ROWS_SQL``.
+
+HANDLED_SCOPE_ALL = "all"
+HANDLED_SCOPE_CHANNEL = "channel"
+
+
+def derive_handled_marker(
+    *,
+    reacting_to: int,
+    focal_channel: str | None,
+    stayed_silent: bool,
+    suppressed_delivery: bool,
+    delivered_to_focal: bool,
+) -> dict[str, Any]:
+    """Compute the wake-gate ``handled`` marker for an assistant message.
+
+    The classification is explicit, not inferred from message shape, so the
+    gate never has to guess reply-vs-silent fragilely.  The caller passes the
+    same delivery signals the step body already computed:
+
+    * ``stayed_silent`` — the model called ``stay_silent`` this turn.
+    * ``suppressed_delivery`` — every new user-stimulus event arrived on a
+      channel OTHER than the focal one, so the bare-text reply was NOT
+      delivered (``autodelivery_suppressed`` in ``loop.py``).
+    * ``delivered_to_focal`` — a reply WAS delivered to the focal channel:
+      bare text auto-delivered as a connector send (``autodeliver_focal_text``
+      fired), or the model emitted a focal-targeted connector send that was
+      not rejected.
+
+    Only a delivered focal reply is channel-scoped — and only when there IS a
+    focal channel to scope to.  Everything else is decline-all:
+
+    * A delivered reply handled ONLY the channel it spoke on; other channels'
+      pending stimulus must still re-wake the session.
+    * Silence / suppression / no-delivery is the model declining or deferring
+      ALL visible stimulus, so the global floor advances and ordinary ignored
+      group chatter the model keeps stay_silent-ing does not re-wake forever.
+
+    CRITICAL: a suppressed off-focal reply is decline-all, NOT channel-scoped.
+    The reply was composed for the off-focal channel but never delivered;
+    scoping the marker to that channel would wrongly mark it handled and
+    re-drop the message.  Declining-all here is safe — the off-focal stimulus
+    is below the global floor either way, and the model sees its
+    monologue-prefixed text on the next real stimulus and can switch + send.
+    """
+    if delivered_to_focal and not suppressed_delivery and not stayed_silent and focal_channel:
+        return {
+            "scope": HANDLED_SCOPE_CHANNEL,
+            "channel": focal_channel,
+            "seq": reacting_to,
+        }
+    return {"scope": HANDLED_SCOPE_ALL, "seq": reacting_to}
 
 
 def drop_trivial_monologue(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

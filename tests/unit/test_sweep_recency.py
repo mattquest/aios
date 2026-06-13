@@ -69,9 +69,11 @@ async def test_candidate_scan_bounded_but_confirmed_scan_is_not() -> None:
 
     candidate_call = conn.fetch.await_args_list[0]
     candidate_sql = candidate_call.args[0]
-    # Both the CTE and the outer scan carry the bound (see the comment on
-    # CANDIDATE_ROWS_SQL for why bounding both is correct).
-    assert candidate_sql.count("created_at >= $1") == 2
+    # Both handled-marker CTEs (session_floor + session_channel_handled) and
+    # the outer scan carry the bound — three occurrences (see the comment on
+    # CANDIDATE_ROWS_SQL for why bounding the assistant-message scans is
+    # correct).
+    assert candidate_sql.count("created_at >= $1") == 3
     assert candidate_call.args[1:] == (_SINCE,)
 
     confirmed_call = conn.fetch.await_args_list[1]

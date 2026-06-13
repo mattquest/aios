@@ -143,27 +143,91 @@ GHOST_SPAN_START_SQL = """
 # produce false *positives* (extra candidates), never false negatives, and
 # spurious wakes are absorbed by the per-session entry guard in
 # ``loop._run_session_step_body`` (scoped, unbounded, exact).
-CANDIDATE_ROWS_SQL = """
-    WITH session_max_reacting AS (
+# Per-channel wake watermark (issue: a single session multiplexing several
+# Signal channels through one focal channel).  The OLD gate compared every
+# unreacted event against a single global ``MAX(reacting_to)`` scalar; a DM
+# reply stamping reacting_to=11 wrongly covered a co-pending group message at
+# seq 10, silently dropping it.  The gate now reads the per-assistant-message
+# ``handled`` marker (``channels.derive_handled_marker``) instead:
+#
+#   * ``session_floor.global_floor`` = MAX seq the model DECLINED all stimulus
+#     up to — over decline-all markers (``handled.scope = 'all'``).  Events on
+#     ANY channel (and channel-less events) at or below it are handled.
+#   * ``session_channel_handled`` = per-(session, channel) MAX seq a delivered
+#     focal reply handled THAT channel up to (``handled.scope = 'channel'``).
+#     Leaves other channels live.
+#
+# An event on channel C is unhandled iff its seq exceeds
+# GREATEST(global_floor, channel_handled[C]); a channel-less event
+# (``channel IS NULL``) is unhandled iff its seq exceeds global_floor alone.
+#
+# BACKWARD COMPAT: assistant messages predating this change carry only
+# ``reacting_to`` and no ``handled`` marker.  The ``ELSE`` branch of the
+# ``global_floor`` CASE interprets them as decline-all at seq=reacting_to, so
+# on deploy ``global_floor`` equals the old ``MAX(reacting_to)`` exactly and no
+# historical stimulus suddenly becomes unhandled — with zero new-format
+# messages the gate is byte-for-byte equivalent to the old one.  A channel
+# message would also have to count toward the floor under the old rule; it does
+# (no ``handled`` ⇒ ELSE branch ⇒ contributes reacting_to to the floor).
+#
+# Both CTEs share the assistant-message scan shape (predicate + index) of the
+# query they replace, so the recency-bounding argument and the no-N+1 hoisted
+# aggregation are preserved (a channel-scoped row simply yields NULL from the
+# floor CASE and MAX ignores it).  The per-channel CTE groups by the JSON
+# ``handled.channel`` extracted from the same rows — no extra scan, no extra
+# index (the assistant-message rows are already read for the floor).
+_SESSION_HANDLED_CTES = """
+    session_floor AS (
         SELECT session_id,
-               MAX(COALESCE((data->>'reacting_to')::bigint, seq)) AS max_reacting
+               MAX(CASE
+                     WHEN data->'handled'->>'scope' = 'all'
+                       THEN (data->'handled'->>'seq')::bigint
+                     WHEN data ? 'handled'
+                       THEN NULL
+                     ELSE COALESCE((data->>'reacting_to')::bigint, seq)
+                   END) AS global_floor
           FROM events
          WHERE kind = 'message' AND role = 'assistant'
          {cte_scope_clause}
          {cte_recency_clause}
          GROUP BY session_id
+    ),
+    session_channel_handled AS (
+        SELECT session_id,
+               data->'handled'->>'channel' AS channel,
+               MAX((data->'handled'->>'seq')::bigint) AS handled_seq
+          FROM events
+         WHERE kind = 'message' AND role = 'assistant'
+           AND data->'handled'->>'scope' = 'channel'
+           AND data->'handled' ? 'channel'
+         {cte_scope_clause}
+         {cte_recency_clause}
+         GROUP BY session_id, data->'handled'->>'channel'
     )
+"""
+
+CANDIDATE_ROWS_SQL = (
+    """
+    WITH """
+    + _SESSION_HANDLED_CTES
+    + """
     SELECT DISTINCT e.session_id
       FROM events e
       JOIN sessions s ON s.id = e.session_id
-      LEFT JOIN session_max_reacting smr ON smr.session_id = e.session_id
+      LEFT JOIN session_floor sf ON sf.session_id = e.session_id
+      LEFT JOIN session_channel_handled sch
+        ON sch.session_id = e.session_id AND sch.channel = e.channel
      WHERE s.archived_at IS NULL
        AND e.kind = 'message'
        AND e.role <> 'assistant'
-       AND (smr.max_reacting IS NULL OR e.seq > smr.max_reacting)
+       AND e.seq > GREATEST(
+             COALESCE(sf.global_floor, 0),
+             CASE WHEN e.channel IS NULL THEN 0 ELSE COALESCE(sch.handled_seq, 0) END
+           )
        {scope_clause}
        {recency_clause}
 """
+)
 
 # Deliberately NOT recency-bounded: a confirmed-but-undispatched tool call
 # produces no further events while it waits, so an old ``tool_confirmed
@@ -191,22 +255,50 @@ CONFIRMED_ROWS_SQL = """
        {scope_clause}
 """
 
+# Same per-channel handled derivation as CANDIDATE_ROWS_SQL (see
+# ``_SESSION_HANDLED_CTES``), scoped to the candidate session list rather than
+# the cross-session scan.  An event on channel C is unhandled iff its seq
+# exceeds GREATEST(global_floor, channel_handled[C]); a channel-less event
+# checks the global floor alone.  Backward compat (no ``handled`` marker ⇒
+# decline-all at reacting_to) is the same ELSE branch.
 UNREACTED_ROWS_SQL = """
-    WITH session_max_reacting AS (
+    WITH session_floor AS (
         SELECT session_id,
-               MAX(COALESCE((data->>'reacting_to')::bigint, seq)) AS max_reacting
+               MAX(CASE
+                     WHEN data->'handled'->>'scope' = 'all'
+                       THEN (data->'handled'->>'seq')::bigint
+                     WHEN data ? 'handled'
+                       THEN NULL
+                     ELSE COALESCE((data->>'reacting_to')::bigint, seq)
+                   END) AS global_floor
           FROM events
          WHERE kind = 'message' AND role = 'assistant'
            AND session_id = ANY($1::text[])
          GROUP BY session_id
+    ),
+    session_channel_handled AS (
+        SELECT session_id,
+               data->'handled'->>'channel' AS channel,
+               MAX((data->'handled'->>'seq')::bigint) AS handled_seq
+          FROM events
+         WHERE kind = 'message' AND role = 'assistant'
+           AND data->'handled'->>'scope' = 'channel'
+           AND data->'handled' ? 'channel'
+           AND session_id = ANY($1::text[])
+         GROUP BY session_id, data->'handled'->>'channel'
     )
     SELECT e.session_id, e.data
       FROM events e
-      LEFT JOIN session_max_reacting smr ON smr.session_id = e.session_id
+      LEFT JOIN session_floor sf ON sf.session_id = e.session_id
+      LEFT JOIN session_channel_handled sch
+        ON sch.session_id = e.session_id AND sch.channel = e.channel
      WHERE e.session_id = ANY($1::text[])
        AND e.kind = 'message'
        AND e.role <> 'assistant'
-       AND e.seq > COALESCE(smr.max_reacting, 0)
+       AND e.seq > GREATEST(
+             COALESCE(sf.global_floor, 0),
+             CASE WHEN e.channel IS NULL THEN 0 ELSE COALESCE(sch.handled_seq, 0) END
+           )
 """
 
 # The batch-filter trio below (UNREACTED / ALL_RESULT / ALL_ASST) is scoped
@@ -242,7 +334,8 @@ ALL_ASST_ROWS_SQL = """
 # pending`` flip provided.
 #
 # Shape: two ``MAX(seq)``-per-session CTEs joined — the same hoisted-aggregation
-# pattern as ``session_max_reacting`` above, so no correlated SubPlan re-scans
+# pattern as ``session_floor`` / ``session_channel_handled`` above, so no
+# correlated SubPlan re-scans
 # ``events`` (the #140 pathology). The error CTE is backed by the partial index
 # ``events_turn_error_idx`` (migration 0062). The user CTE joins ``err_max``
 # so it aggregates only the sessions the outer join will actually consult —
@@ -566,9 +659,13 @@ async def find_sessions_needing_inference(
     A session needs inference when:
 
     (a) It has message events but no assistant message (first turn).
-    (b) It has non-assistant message events with ``seq`` greater than
-        the last assistant message's ``reacting_to`` — these are events
-        the model hasn't reacted to yet.
+    (b) It has non-assistant message events the model has not handled —
+        an event on channel C is unhandled when its ``seq`` exceeds both
+        the session's decline-all global floor and channel C's per-channel
+        handled watermark (a channel-less event checks the global floor
+        alone).  Both are derived from the ``handled`` marker on assistant
+        messages (``channels.derive_handled_marker``); see
+        ``CANDIDATE_ROWS_SQL``.
     (c) It has a ``tool_confirmed allow`` lifecycle event for a
         ``tool_call_id`` that has no result and no in-flight task
         (needs dispatch via ``_dispatch_confirmed_tools``).

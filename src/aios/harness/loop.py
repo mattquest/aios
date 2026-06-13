@@ -478,6 +478,7 @@ async def _run_session_step_body(
 
     silence: dict[str, Any] | None = None
     suppressed_delivery = False
+    autodelivered_focal_text = False
     if channels:
         from aios.harness.channels import (
             apply_monologue_prefix,
@@ -515,6 +516,7 @@ async def _run_session_step_body(
             ):
                 suppressed_delivery = True
             else:
+                autodelivered_focal_text = delivered is not assistant_msg
                 assistant_msg = delivered
         assistant_msg = apply_monologue_prefix(assistant_msg)
 
@@ -539,8 +541,34 @@ async def _run_session_step_body(
 
     # Record the seq of the latest user/tool event in the context this
     # response was based on; events after this seq are "new" on the next
-    # wake. ``find_sessions_needing_inference`` uses it as the watermark.
+    # wake. The context builder uses ``reacting_to`` as its visibility
+    # horizon / blind-spot anchor (unchanged); the wake gate uses the
+    # separate ``handled`` marker stamped below.
     assistant_msg["reacting_to"] = step_ctx.reacting_to
+
+    # Per-channel wake watermark (the ``handled`` marker — see
+    # ``channels.derive_handled_marker``).  A reply delivered to the focal
+    # channel handles only that channel; silence / suppression / no-delivery
+    # declines all visible stimulus and advances the global floor.  Delivery
+    # to the focal channel means either bare text was auto-delivered as a
+    # connector send, or the model emitted a focal-targeted connection send
+    # (``channel_id == focal_channel``) that survived rejection.
+    from aios.harness.channels import derive_handled_marker
+
+    rejected_ids = {r["tool_call_id"] for r in rejections}
+    delivered_focal_send = autodelivered_focal_text or _has_focal_send(
+        assistant_msg,
+        prelude.focal_connection_tool_names,
+        session.focal_channel,
+        rejected_ids,
+    )
+    assistant_msg["handled"] = derive_handled_marker(
+        reacting_to=step_ctx.reacting_to,
+        focal_channel=session.focal_channel,
+        stayed_silent=silence is not None,
+        suppressed_delivery=suppressed_delivery,
+        delivered_to_focal=delivered_focal_send,
+    )
 
     # Append assistant message to the session log (unfenced — procrastinate
     # lock provides mutual exclusion).  When the message carries rejected
@@ -632,8 +660,8 @@ async def _run_session_step_body(
     # turn anyway and any stimulus can wake it (``Session.awaiting``
     # surfaces what's still pending).  Rejected off-focal connection
     # calls are already resolved by their error results — nothing to
-    # dispatch or hold pending for them.
-    rejected_ids = {r["tool_call_id"] for r in rejections}
+    # dispatch or hold pending for them.  ``rejected_ids`` was computed
+    # above for the handled-marker delivery check.
     tool_calls: list[dict[str, Any]] = [
         tc for tc in (assistant_msg.get("tool_calls") or []) if tc.get("id") not in rejected_ids
     ]
@@ -778,6 +806,40 @@ def _tc_name(tc: dict[str, Any]) -> str:
     """Extract the function name from a tool_call dict."""
     name: str = (tc.get("function") or {}).get("name", "")
     return name
+
+
+def _has_focal_send(
+    assistant_msg: dict[str, Any],
+    focal_connection_tool_names: frozenset[str],
+    focal_channel: str | None,
+    rejected_ids: set[str],
+) -> bool:
+    """True when the assistant message carries a focal-targeted connection
+    call that will be delivered to the focal channel.
+
+    A call counts as a delivered focal reply when it names a focal-targeted
+    connection tool (``focal_connection_tool_names`` — the ``<connector>_send``
+    family that gained the required ``channel_id`` argument), states
+    ``channel_id == focal_channel``, and was not rejected.  This is exactly the
+    set of calls the connector runtime forwards to the focal channel, so the
+    structural check matches the actual delivery — covering both an
+    auto-delivered bare-text send and a model-emitted send.  Returns ``False``
+    with no focal channel (nothing to scope a reply to).
+    """
+    if not focal_channel:
+        return False
+    from aios.tools.invoke import parse_arguments
+
+    for tc in assistant_msg.get("tool_calls") or []:
+        if tc.get("id") in rejected_ids:
+            continue
+        name = (tc.get("function") or {}).get("name") or ""
+        if name not in focal_connection_tool_names:
+            continue
+        args = parse_arguments((tc.get("function") or {}).get("arguments"))
+        if args is not None and args.get("channel_id") == focal_channel:
+            return True
+    return False
 
 
 def _is_known_mcp_server(server_name: str, mcp_server_map: dict[str, McpServerSpec]) -> bool:
