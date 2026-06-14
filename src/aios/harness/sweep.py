@@ -206,6 +206,21 @@ _SESSION_HANDLED_CTES = """
     )
 """
 
+# Fire-and-forget exclusion: a tool-role result carrying
+# ``data->>'no_reaction' = 'true'`` is a successful delivery confirmation
+# (a connector send/react) the model need not react to.  Excluding it from
+# the stimulus predicate (alongside ``e.role <> 'assistant'``) stops a
+# session re-inferring purely to acknowledge its own outbound — the
+# duplicate-send loop fix.  Backward-compat: historical results have no
+# marker, so ``IS DISTINCT FROM 'true'`` keeps them reaction-required (it is
+# also NULL-safe — a missing key yields NULL, which is distinct from
+# 'true').  A FAILED fire-and-forget result carries no marker (the connector
+# sets ``no_reaction`` only on the success path), so delivery failures still
+# wake.  This is orthogonal to the per-channel handled watermark above: the
+# send result is on the focal channel, but it is dropped before the
+# watermark comparison regardless of channel.  The SAME predicate is mirrored
+# in ``UNREACTED_ROWS_SQL`` and ``queries._SESSION_ACTIVE_EXPR``; keep all
+# three in lock-step.
 CANDIDATE_ROWS_SQL = (
     """
     WITH """
@@ -220,6 +235,7 @@ CANDIDATE_ROWS_SQL = (
      WHERE s.archived_at IS NULL
        AND e.kind = 'message'
        AND e.role <> 'assistant'
+       AND e.data->>'no_reaction' IS DISTINCT FROM 'true'
        AND e.seq > GREATEST(
              COALESCE(sf.global_floor, 0),
              CASE WHEN e.channel IS NULL THEN 0 ELSE COALESCE(sch.handled_seq, 0) END
@@ -295,6 +311,7 @@ UNREACTED_ROWS_SQL = """
      WHERE e.session_id = ANY($1::text[])
        AND e.kind = 'message'
        AND e.role <> 'assistant'
+       AND e.data->>'no_reaction' IS DISTINCT FROM 'true'
        AND e.seq > GREATEST(
              COALESCE(sf.global_floor, 0),
              CASE WHEN e.channel IS NULL THEN 0 ELSE COALESCE(sch.handled_seq, 0) END

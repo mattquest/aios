@@ -302,6 +302,32 @@ class Harness:
             self._pool, session_id, content, account_id=account_id
         )
 
+    async def append_tool_result(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        content: str,
+        *,
+        is_error: bool = False,
+        no_reaction: bool = False,
+    ) -> Event:
+        """Append a tool-role result (mirrors the connector-runtime intake).
+
+        ``no_reaction=True`` stamps the fire-and-forget marker so the wake
+        gate excludes it.  Requires a parent assistant ``tool_calls`` entry
+        for ``tool_call_id`` (``lookup_tool_name_by_call_id``)."""
+        account_id = "acc_test_stub"  # PR 3 scaffolding
+        async with self._pool.acquire() as conn:
+            return await sessions_service.append_tool_result(
+                conn,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                content=content,
+                is_error=is_error,
+                no_reaction=no_reaction,
+                account_id=account_id,
+            )
+
     async def confirm_tool(
         self,
         session_id: str,

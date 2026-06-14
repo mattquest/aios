@@ -98,6 +98,7 @@ ToolFn = Callable[..., Awaitable[Any]]
 log: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 _TOOL_ATTR = "__aios_http_tool__"
+_TOOL_FIRE_AND_FORGET_ATTR = "__aios_http_tool_fire_and_forget__"
 _MGMT_ATTR = "__aios_http_management__"
 
 
@@ -131,6 +132,7 @@ def _is_fatal_inbound_status(status_code: int) -> bool:
 def tool(
     *,
     name: str | None = None,
+    fire_and_forget: bool = False,
 ) -> Callable[[ToolFn], ToolFn]:
     """Decorate a method as a connector tool.
 
@@ -142,10 +144,22 @@ def tool(
     The runner publishes a derived JSON Schema for every ``@tool`` once
     at startup via ``PUT /v1/connectors/{connector}/tools_schema``;
     individual connections inherit it from the type catalog.
+
+    ``fire_and_forget=True`` declares that a *successful* result of this
+    tool is a pure delivery confirmation the model need not react to —
+    message-delivery tools (send / react).  When such a tool succeeds,
+    :meth:`dispatch_call` sets ``no_reaction=true`` on the result POST so
+    aios appends the result but does NOT wake the session to react to its
+    own confirmation (the duplicate-send loop fix).  A *failed* result is
+    never fire-and-forget: the model must react to a delivery failure, so
+    the flag only applies on the success path.  Leave it ``False`` for
+    tools whose result carries data the model needs (list_*, create_*,
+    get_*).
     """
 
     def _wrap(f: ToolFn) -> ToolFn:
         setattr(f, _TOOL_ATTR, name or f.__name__)
+        setattr(f, _TOOL_FIRE_AND_FORGET_ATTR, fire_and_forget)
         return f
 
     return _wrap
@@ -158,6 +172,7 @@ class _ToolMeta:
     fn: ToolFn
     focal_params: frozenset[str]
     sandbox_params: tuple[tuple[str, str], ...]  # (param_name, "scalar" | "list")
+    fire_and_forget: bool
 
 
 def management_handler(
@@ -931,6 +946,12 @@ class HttpConnector:
             session_id=session_id,
             tool_call_id=tool_call_id,
             content=result,
+            # Fire-and-forget tools (send / react): a successful result is a
+            # pure delivery confirmation.  Flag it so aios appends the result
+            # but does not wake the session to react to its own confirmation.
+            # The error branches above never reach here, so the flag is only
+            # ever set on success — a failure must still wake (retry/narrate).
+            no_reaction=meta.fire_and_forget,
         )
         log.info(
             "connector.tool_call.completed",
@@ -938,6 +959,7 @@ class HttpConnector:
             tool_call_id=tool_call_id,
             session_id=session_id,
             is_error=False,
+            no_reaction=meta.fire_and_forget,
         )
 
     async def _management_call_loop(self) -> None:
@@ -1128,14 +1150,22 @@ class HttpConnector:
         tool_call_id: str,
         content: str | list[dict[str, Any]],
         is_error: bool = False,
+        no_reaction: bool = False,
     ) -> None:
-        """POST one tool result via the generated runtime op."""
+        """POST one tool result via the generated runtime op.
+
+        ``no_reaction`` rides on the body for a successful fire-and-forget
+        result; aios appends the result but skips the wake (see
+        :func:`tool`).  Only ever ``True`` on the success path — a failed
+        result must wake.
+        """
         body = RuntimeToolResultRequest(
             connection_id=connection_id,
             session_id=session_id,
             tool_call_id=tool_call_id,
             content=content,
             is_error=is_error,
+            no_reaction=no_reaction,
         )
         response = await _post_runtime_tool_result(client=client, body=body)
         if response.status_code >= 400:
@@ -1191,7 +1221,12 @@ def _build_tool_meta(fn: ToolFn) -> _ToolMeta:
         kind = _sandbox_path_kind(hint)
         if kind is not None:
             sandbox.append((param_name, kind))
-    return _ToolMeta(fn=fn, focal_params=focal, sandbox_params=tuple(sandbox))
+    return _ToolMeta(
+        fn=fn,
+        focal_params=focal,
+        sandbox_params=tuple(sandbox),
+        fire_and_forget=bool(getattr(fn, _TOOL_FIRE_AND_FORGET_ATTR, False)),
+    )
 
 
 class SandboxPathError(ValueError):

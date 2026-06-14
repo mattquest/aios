@@ -73,6 +73,20 @@ class _ProbeConnector(HttpConnector):
         self.calls.append(("say_struct", {"n": n}))
         return {"doubled": n * 2}
 
+    @tool(fire_and_forget=True)
+    async def send(self, *, text: str) -> dict[str, str]:
+        """Fire-and-forget tool: a successful result is a pure delivery
+        confirmation the model need not react to."""
+        self.calls.append(("send", {"text": text}))
+        return {"status": "ok"}
+
+    @tool(fire_and_forget=True)
+    async def send_boom(self) -> dict[str, str]:
+        """Fire-and-forget tool that fails — the error result must NOT carry
+        ``no_reaction`` (a delivery failure must wake)."""
+        self.calls.append(("send_boom", {}))
+        raise RuntimeError("send failed")
+
     async def _post_tool_result(  # type: ignore[override]
         self,
         client: Any,
@@ -82,6 +96,7 @@ class _ProbeConnector(HttpConnector):
         tool_call_id: str,
         content: str | list[dict[str, Any]],
         is_error: bool = False,
+        no_reaction: bool = False,
     ) -> None:
         del client
         self.results.append(
@@ -91,6 +106,7 @@ class _ProbeConnector(HttpConnector):
                 tool_call_id=tool_call_id,
                 content=content,
                 is_error=is_error,
+                no_reaction=no_reaction,
             )
         )
 
@@ -178,6 +194,59 @@ class TestDispatch:
         r = probe.results[0]
         assert r.kwargs["is_error"] is True
 
+    async def test_non_fire_and_forget_tool_does_not_set_no_reaction(
+        self, probe: _ProbeConnector
+    ) -> None:
+        """An ordinary tool's successful result carries ``no_reaction=False``
+        so aios wakes the session to react to it (the default behavior)."""
+        await probe.dispatch_call(
+            {
+                "connection_id": "conn_1",
+                "tool_call_id": "call_1",
+                "session_id": "sess_1",
+                "name": "shout",
+                "arguments": json.dumps({"text": "hi"}),
+            }
+        )
+        r = probe.results[0]
+        assert r.kwargs["is_error"] is False
+        assert r.kwargs["no_reaction"] is False
+
+    async def test_fire_and_forget_success_sets_no_reaction(self, probe: _ProbeConnector) -> None:
+        """A ``fire_and_forget=True`` tool's SUCCESSFUL result rides
+        ``no_reaction=True`` so aios appends it without waking the session."""
+        await probe.dispatch_call(
+            {
+                "connection_id": "conn_1",
+                "tool_call_id": "call_send",
+                "session_id": "sess_1",
+                "name": "send",
+                "arguments": json.dumps({"text": "hello"}),
+            }
+        )
+        r = probe.results[0]
+        assert r.kwargs["is_error"] is False
+        assert r.kwargs["no_reaction"] is True
+
+    async def test_fire_and_forget_failure_does_not_set_no_reaction(
+        self, probe: _ProbeConnector
+    ) -> None:
+        """A FAILED fire-and-forget result must NOT carry ``no_reaction`` — a
+        delivery failure must wake the model to retry/narrate.  The error path
+        posts the result without the flag (defaulting to False)."""
+        await probe.dispatch_call(
+            {
+                "connection_id": "conn_1",
+                "tool_call_id": "call_sb",
+                "session_id": "sess_1",
+                "name": "send_boom",
+                "arguments": "{}",
+            }
+        )
+        r = probe.results[0]
+        assert r.kwargs["is_error"] is True
+        assert r.kwargs["no_reaction"] is False
+
 
 class TestToolCollection:
     async def test_collects_decorated_methods_only(self) -> None:
@@ -212,6 +281,28 @@ class TestToolCollection:
         c = Conn()
         assert "published_name" in c._tools
         assert "internal_method" not in c._tools
+
+    async def test_fire_and_forget_recorded_on_meta(self) -> None:
+        """``fire_and_forget`` is frozen onto ``_ToolMeta`` once at construction;
+        an undecorated default is ``False``."""
+
+        class Conn(HttpConnector):
+            connector = "test"
+
+            def __init__(self) -> None:
+                super().__init__(base_url="x", token="t")
+
+            @tool(fire_and_forget=True)
+            async def faf(self) -> str:
+                return "ok"
+
+            @tool()
+            async def plain(self) -> str:
+                return "ok"
+
+        c = Conn()
+        assert c._tools["faf"].fire_and_forget is True
+        assert c._tools["plain"].fire_and_forget is False
 
     async def test_subclass_without_connector_attr_raises(self) -> None:
         """Forgetting ``connector = ...`` is a programmer error — must crash."""

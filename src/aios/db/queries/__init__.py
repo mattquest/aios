@@ -791,7 +791,11 @@ async def list_agent_versions(
 #     unhandled iff its seq exceeds GREATEST(decline-all global floor, channel
 #     C's per-channel handled seq); a channel-less event checks the global floor
 #     alone (mirrors ``sweep._SESSION_HANDLED_CTES`` — see the lock-step note on
-#     the first EXISTS below), OR
+#     the first EXISTS below).  A tool-role result carrying
+#     ``data->>'no_reaction' = 'true'`` (a successful fire-and-forget
+#     send/react) is NOT stimulus — excluded here exactly as the sweep gate
+#     excludes it, so status + the clone gate agree with what the sweep wakes
+#     for. OR
 #   * an unresolved tool_call — an assistant tool_call with no tool-role result
 #     (harness tool in-flight, or blocked on an approval/custom-tool result).
 # ...EXCEPT when ``errored`` (retry budget exhausted, not yet recovered): the
@@ -828,6 +832,7 @@ _SESSION_ACTIVE_EXPR = """(
             SELECT 1 FROM events ev
              WHERE ev.session_id = sessions.id AND ev.account_id = sessions.account_id
                AND ev.kind = 'message' AND ev.role <> 'assistant'
+               AND ev.data->>'no_reaction' IS DISTINCT FROM 'true'
                AND ev.seq > GREATEST(
                    COALESCE((
                        SELECT MAX(CASE

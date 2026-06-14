@@ -169,3 +169,52 @@ class TestAppendToolResultIdempotency:
             f"(data={second_event.data!r}); idempotent return must "
             f"preserve the first-call's truth"
         )
+
+
+class TestAppendToolResultNoReaction:
+    """``no_reaction=True`` stamps a marker on the event data; the default
+    omits it (backward-compat)."""
+
+    async def test_no_reaction_stamps_marker_on_event(
+        self,
+        session_with_parent_tool_call: tuple[asyncpg.Pool[Any], str, str, str],
+    ) -> None:
+        """A successful fire-and-forget result carries ``data['no_reaction']``
+        so the wake gate can exclude it — and is STILL appended (the
+        tool-always-appends-result invariant holds)."""
+        pool, account_id, session_id, tool_call_id = session_with_parent_tool_call
+
+        async with pool.acquire() as conn:
+            event = await sessions_service.append_tool_result(
+                conn,
+                account_id=account_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                content="sent",
+                no_reaction=True,
+            )
+
+        assert event.data["no_reaction"] is True
+        assert event.data["role"] == "tool"
+        # The result is appended, not dropped.
+        count = await _count_tool_results(pool, session_id, tool_call_id)
+        assert count == 1
+
+    async def test_default_omits_marker(
+        self,
+        session_with_parent_tool_call: tuple[asyncpg.Pool[Any], str, str, str],
+    ) -> None:
+        """The default (``no_reaction=False``) leaves no marker — historical
+        and non-fire-and-forget results stay reaction-required."""
+        pool, account_id, session_id, tool_call_id = session_with_parent_tool_call
+
+        async with pool.acquire() as conn:
+            event = await sessions_service.append_tool_result(
+                conn,
+                account_id=account_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                content="result",
+            )
+
+        assert "no_reaction" not in event.data
