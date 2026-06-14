@@ -1062,3 +1062,157 @@ class TestPerChannelWakeWatermark:
         )
         needs = await harness.sessions_needing_inference(session.id)
         assert session.id not in needs, "stay_silent decline-all clears the deferred channel"
+
+
+# ─── fire-and-forget (no_reaction) wake exclusion ────────────────────────────
+
+
+async def _append_assistant_with_tool_call(
+    harness: Harness, session_id: str, *, tool_call_id: str, tool_name: str, reacting_to: int
+) -> None:
+    """Append an assistant message carrying a single ``tool_calls`` entry, so
+    a subsequent ``append_tool_result`` has a parent to resolve the name from.
+    The model 'handled' all stimulus up to ``reacting_to`` (decline-all) so the
+    only thing that could re-wake is a new stimulus — e.g. the tool result."""
+    await sessions_service.append_event(
+        harness._pool,
+        session_id,
+        "message",
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+            "reacting_to": reacting_to,
+            "handled": {"scope": "all", "seq": reacting_to},
+        },
+        account_id=_ACCT,
+    )
+
+
+@needs_docker
+class TestFireAndForgetWakeExclusion:
+    """A successful fire-and-forget tool result (``data['no_reaction']=true``)
+    is appended but must NOT count as unreacted stimulus — the session does
+    not re-infer purely to acknowledge its own send.  A FAILED result, a
+    non-marked result, and a co-pending real user message all still wake.
+    """
+
+    async def test_successful_send_result_does_not_wake(self, harness: Harness) -> None:
+        """signal_send -> success result with ``no_reaction`` -> the session
+        does NOT need inference (the duplicate-send loop fix)."""
+        harness.script_model([])
+        session = await harness.start("seed")  # user seq 1
+        # Model handled the seed and emitted a send tool_call.
+        await _append_assistant_with_tool_call(
+            harness, session.id, tool_call_id="call_send", tool_name="signal_send", reacting_to=1
+        )
+        # The send succeeds; the connector flags the result no_reaction.
+        evt = await harness.append_tool_result(
+            session.id, "call_send", '{"sent_at_ms": 123}', no_reaction=True
+        )
+        assert evt.data["no_reaction"] is True  # appended WITH the marker
+        # The result is the only new stimulus, and it is excluded → no wake.
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id not in needs, (
+            "a successful fire-and-forget send result must not re-wake the "
+            "session — it would re-infer purely to ack its own delivery"
+        )
+
+    async def test_failed_send_result_wakes(self, harness: Harness) -> None:
+        """A FAILED fire-and-forget result carries no marker (the connector
+        sets no_reaction only on success) → it DOES wake (retry/narrate)."""
+        harness.script_model([])
+        session = await harness.start("seed")
+        await _append_assistant_with_tool_call(
+            harness, session.id, tool_call_id="call_send", tool_name="signal_send", reacting_to=1
+        )
+        # Failure: is_error=True, no_reaction NOT set.
+        evt = await harness.append_tool_result(
+            session.id, "call_send", '{"error": "delivery failed"}', is_error=True
+        )
+        assert "no_reaction" not in evt.data
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs, "a failed send result must wake the model to retry/narrate"
+
+    async def test_non_fire_and_forget_result_wakes(self, harness: Harness) -> None:
+        """A non-fire-and-forget connector tool result (list/create/get) carries
+        no marker → it DOES wake so the model can use the returned data."""
+        harness.script_model([])
+        session = await harness.start("seed")
+        await _append_assistant_with_tool_call(
+            harness,
+            session.id,
+            tool_call_id="call_list",
+            tool_name="signal_create_group",
+            reacting_to=1,
+        )
+        evt = await harness.append_tool_result(
+            session.id, "call_list", '{"group_id": "g_new"}', no_reaction=False
+        )
+        assert "no_reaction" not in evt.data
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs, (
+            "a non-fire-and-forget result carries data the model needs — it must wake"
+        )
+
+    async def test_copending_user_message_still_wakes(self, harness: Harness) -> None:
+        """No false negative that matters: a no_reaction send result present
+        alongside a real co-pending user message must STILL wake — only the
+        send result itself is excluded, not the user message."""
+        harness.script_model([])
+        session = await harness.start("seed")
+        await _append_assistant_with_tool_call(
+            harness, session.id, tool_call_id="call_send", tool_name="signal_send", reacting_to=1
+        )
+        # The send result (excluded) AND a fresh user message (not excluded).
+        await harness.append_tool_result(
+            session.id, "call_send", '{"sent_at_ms": 123}', no_reaction=True
+        )
+        await harness.inject_message(session.id, "a real new message")
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs, (
+            "a co-pending real user message must wake even when a no_reaction "
+            "send result is present — the exclusion is surgical to the send"
+        )
+
+    async def test_unmarked_result_wakes_backward_compat(self, harness: Harness) -> None:
+        """Backward-compat: a tool result with NO marker (every historical
+        result, and any not-yet-redeployed connector) wakes exactly as before.
+        ``IS DISTINCT FROM 'true'`` keeps a missing key reaction-required."""
+        harness.script_model([])
+        session = await harness.start("seed")
+        await _append_assistant_with_tool_call(
+            harness, session.id, tool_call_id="call_send", tool_name="signal_send", reacting_to=1
+        )
+        # Old-runtime POST: no no_reaction field at all.
+        evt = await harness.append_tool_result(session.id, "call_send", '{"sent_at_ms": 123}')
+        assert "no_reaction" not in evt.data
+        needs = await harness.sessions_needing_inference(session.id)
+        assert session.id in needs, "an unmarked result must wake (no behavior change for history)"
+
+    async def test_active_expr_agrees_no_reaction_is_idle(self, harness: Harness) -> None:
+        """``_SESSION_ACTIVE_EXPR`` (derived status / clone gate) must AGREE
+        with the wake gate: a session whose only new event is a no_reaction
+        send result is NOT active (else the clone gate would treat a settled
+        session as owed work)."""
+        harness.script_model([])
+        session = await harness.start("seed")
+        await _append_assistant_with_tool_call(
+            harness, session.id, tool_call_id="call_send", tool_name="signal_send", reacting_to=1
+        )
+        await harness.append_tool_result(
+            session.id, "call_send", '{"sent_at_ms": 123}', no_reaction=True
+        )
+        # The tool_call now has its result, so there is no unresolved tool_call;
+        # the result itself is no_reaction → no unreacted stimulus → idle.
+        status = (await harness.session(session.id)).status
+        assert status == "idle", (
+            "_SESSION_ACTIVE_EXPR must exclude a no_reaction result exactly as "
+            "the wake gate does, or status + the clone gate disagree with the sweep"
+        )

@@ -225,7 +225,7 @@ class WhatsappConnector(WhatsappManagementMixin, HttpConnector):
 
     # ── tools ──────────────────────────────────────────────────────────
 
-    @tool()
+    @tool(fire_and_forget=True)
     async def whatsapp_send(
         self,
         text: str,
@@ -289,7 +289,7 @@ class WhatsappConnector(WhatsappManagementMixin, HttpConnector):
             raise RuntimeError(f"sendMessage returned non-dict: {result!r}")
         return result
 
-    @tool()
+    @tool(fire_and_forget=True)
     async def whatsapp_react(
         self,
         message_id: str,

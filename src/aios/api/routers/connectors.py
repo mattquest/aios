@@ -222,6 +222,15 @@ class RuntimeToolResultRequest(BaseModel):
     tool_call_id: str
     content: str | list[dict[str, Any]]
     is_error: bool = False
+    # ``no_reaction`` marks a SUCCESSFUL fire-and-forget result (a pure
+    # delivery confirmation: a send/react the model need not react to).
+    # When true AND NOT ``is_error``, the handler appends the result with a
+    # marker on the event data and SKIPS the wake — the session is not
+    # re-inferred solely to acknowledge its own delivery.  A failed result is
+    # never fire-and-forget (the model must retry/narrate), so the wake-skip
+    # is gated on ``not is_error``.  Defaults false: old connector runtimes
+    # (and every historical result) omit it and wake exactly as before.
+    no_reaction: bool = False
 
 
 class RuntimeLifecycleRequest(BaseModel):
@@ -601,15 +610,25 @@ async def post_runtime_tool_result(
                     "connection_id": body.connection_id,
                 },
             )
+        # A successful fire-and-forget result (``no_reaction`` AND NOT
+        # ``is_error``) is a pure delivery confirmation: append it with a
+        # marker on the event data so the wake gate excludes it, and skip
+        # the wake entirely.  Anything else (a failure, or a non-marked
+        # result) keeps the append + ``defer_wake`` behavior unchanged.
+        no_reaction = body.no_reaction and not body.is_error
         event = await sessions_service.append_tool_result(
             conn,
             session_id=body.session_id,
             tool_call_id=body.tool_call_id,
             content=body.content,
             is_error=body.is_error,
+            no_reaction=no_reaction,
             account_id=account_id,
         )
-    await defer_wake(pool, body.session_id, cause="connector_tool_result", account_id=account_id)
+    if not no_reaction:
+        await defer_wake(
+            pool, body.session_id, cause="connector_tool_result", account_id=account_id
+        )
     return event
 
 

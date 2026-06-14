@@ -479,6 +479,7 @@ async def append_tool_result(
     tool_call_id: str,
     content: str | list[dict[str, Any]],
     is_error: bool = False,
+    no_reaction: bool = False,
 ) -> Event:
     """Append a tool-role event for a custom tool call (#133).
 
@@ -498,6 +499,14 @@ async def append_tool_result(
     work in the same transaction (e.g. a connection-binding auth check
     in the connector-facing endpoint).  The caller is responsible for
     deferring the wake afterwards.
+
+    ``no_reaction=True`` stamps ``data['no_reaction']=true`` on the event:
+    a successful fire-and-forget result (a send/react delivery
+    confirmation) the wake gate must NOT count as unreacted stimulus.  The
+    result is still appended (the tool-always-appends-result invariant
+    holds); the caller skips the wake.  Callers pass it only for a
+    SUCCESSFUL result — a failure must still wake — so it is never combined
+    with ``is_error``.
     """
     async with conn.transaction():
         await queries.lock_active_session_for_update(conn, session_id, account_id=account_id)
@@ -547,6 +556,8 @@ async def append_tool_result(
         }
         if is_error:
             data["is_error"] = True
+        if no_reaction:
+            data["no_reaction"] = True
         return await queries.append_event(
             conn,
             session_id=session_id,
