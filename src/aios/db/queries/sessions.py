@@ -1037,6 +1037,28 @@ async def lock_active_session_for_update(
         )
 
 
+async def lock_writable_session_for_update(
+    conn: asyncpg.Connection[Any], session_id: str, *, account_id: str
+) -> None:
+    """Row-lock an unarchived session without rejecting its derived status.
+
+    User messages are the recovery path for errored sessions, so their
+    idempotency lock must serialize retries while still allowing that append.
+    Archived sessions remain unwritable, matching :func:`append_event`.
+    """
+    row = await conn.fetchrow(
+        "SELECT 1 FROM sessions "
+        "WHERE id = $1 AND account_id = $2 AND archived_at IS NULL FOR UPDATE",
+        session_id,
+        account_id,
+    )
+    if row is None:
+        raise NotFoundError(
+            f"session {session_id} not found",
+            detail={"session_id": session_id},
+        )
+
+
 async def decrement_open_tool_call_count(
     conn: asyncpg.Connection[Any], session_id: str, *, account_id: str
 ) -> None:

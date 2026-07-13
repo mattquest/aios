@@ -9,11 +9,13 @@ and inject environment variables at container provisioning time.
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import EllipsisType
 from typing import Any, NamedTuple
+from uuid import UUID
 
 import asyncpg
 
@@ -1216,6 +1218,11 @@ async def list_sessions(
     return enriched
 
 
+class UserMessageAppendResult(NamedTuple):
+    event: Event
+    created: bool
+
+
 async def append_user_message(
     pool: asyncpg.Pool[Any],
     session_id: str,
@@ -1224,12 +1231,60 @@ async def append_user_message(
     *,
     account_id: str,
 ) -> Event:
+    """Append a user message and return its event.
+
+    Existing callers retain the historical Event-only surface. The HTTP route
+    uses :func:`append_user_message_with_status` to avoid re-waking a retry.
+    """
+    return (
+        await _append_user_message(
+            pool,
+            session_id,
+            content,
+            metadata=metadata,
+            account_id=account_id,
+        )
+    ).event
+
+
+async def append_user_message_with_status(
+    pool: asyncpg.Pool[Any],
+    session_id: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+    *,
+    account_id: str,
+) -> UserMessageAppendResult:
+    """Append a user message and report whether this call created it."""
+    return await _append_user_message(
+        pool,
+        session_id,
+        content,
+        metadata=metadata,
+        account_id=account_id,
+    )
+
+
+async def _append_user_message(
+    pool: asyncpg.Pool[Any],
+    session_id: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+    *,
+    account_id: str,
+) -> UserMessageAppendResult:
     """Append a `role: user` message event to the session log.
 
     When the inbound path stamps ``metadata["channel"]`` (the connector's
     full channel address), we lift it into the event's ``orig_channel``
     column so the context builder and unread-derivation helpers can key
     off it directly — without re-parsing a JSONB blob on every read.
+
+    A canonical UUID in ``metadata.client_message_id`` makes this append
+    idempotent per account + session. Matching retries return the original
+    event; reusing the id for different content raises ``ConflictError``.
+    Metadata without a valid UUID keeps the historical append-every-time
+    behavior.
     """
     if len(content) > MAX_USER_MESSAGE_CHARS:
         raise PayloadTooLargeError(
@@ -1237,23 +1292,78 @@ async def append_user_message(
             f"(got {len(content):,}); split into multiple messages",
             detail={"max_chars": MAX_USER_MESSAGE_CHARS, "got_chars": len(content)},
         )
+    client_message_id: str | None = None
+    if metadata is not None:
+        raw_client_message_id = metadata.get("client_message_id")
+        if isinstance(raw_client_message_id, str):
+            with suppress(ValueError):
+                client_message_id = str(UUID(raw_client_message_id))
+    normalized_metadata = dict(metadata) if metadata else None
+    if client_message_id is not None:
+        assert normalized_metadata is not None
+        normalized_metadata["client_message_id"] = client_message_id
+
     data: dict[str, Any] = {"role": "user", "content": content}
-    if metadata:
-        data["metadata"] = metadata
+    if normalized_metadata:
+        data["metadata"] = normalized_metadata
     orig_channel: str | None = None
     if metadata is not None:
         channel = metadata.get("channel")
         if isinstance(channel, str):
             orig_channel = channel
     async with pool.acquire() as conn:
-        return await queries.append_event(
+        if client_message_id is None:
+            return UserMessageAppendResult(
+                await queries.append_event(
+                    conn,
+                    session_id=session_id,
+                    kind="message",
+                    data=data,
+                    orig_channel=orig_channel,
+                    account_id=account_id,
+                ),
+                True,
+            )
+
+        precomputed = await queries.precompute_event_append(
             conn,
+            account_id=account_id,
             session_id=session_id,
             kind="message",
             data=data,
             orig_channel=orig_channel,
-            account_id=account_id,
         )
+        async with conn.transaction():
+            await queries.lock_writable_session_for_update(conn, session_id, account_id=account_id)
+            existing = await queries.find_user_message_by_client_message_id(
+                conn,
+                session_id,
+                client_message_id,
+                account_id=account_id,
+            )
+            if existing is not None:
+                if existing.data.get("content") == content:
+                    return UserMessageAppendResult(existing, False)
+                raise ConflictError(
+                    f"client_message_id {client_message_id!r} already belongs to "
+                    "a different message",
+                    detail={
+                        "session_id": session_id,
+                        "client_message_id": client_message_id,
+                    },
+                )
+            return UserMessageAppendResult(
+                await queries.append_event(
+                    conn,
+                    session_id=session_id,
+                    kind="message",
+                    data=data,
+                    orig_channel=orig_channel,
+                    account_id=account_id,
+                    precomputed=precomputed,
+                ),
+                True,
+            )
 
 
 async def append_event(

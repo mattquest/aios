@@ -204,6 +204,8 @@ def _supports_anthropic_cache_control(model: str) -> bool:
 
 _OPENAI_NATIVE_PROVIDERS = frozenset({"openai", "azure"})
 _OPENAI_PROXY_PROVIDERS = frozenset({"openrouter"})
+_XAI_CONVERSATION_HEADER = "x-grok-conv-id"
+_USD_TICKS_PER_USD = 10_000_000_000
 
 
 @cache
@@ -242,6 +244,22 @@ def _supports_openai_prompt_cache_key(model: str) -> bool:
     return False
 
 
+@cache
+def _supports_xai_conversation_id(model: str) -> bool:
+    """True for direct xAI Grok Chat Completions routes.
+
+    xAI's ``x-grok-conv-id`` request header gives the provider a stable
+    conversation identity across calls.  Scope the shim to LiteLLM's direct
+    ``xai`` provider and Grok model ids: OpenRouter and other OpenAI-compatible
+    routes do not document this header and must remain unchanged.
+    """
+    try:
+        model_name, provider, _, _ = litellm.get_llm_provider(model)
+    except Exception:
+        return False
+    return provider == "xai" and (model_name or "").lower().startswith("grok")
+
+
 def _apply_provider_cache_hints(
     kwargs: dict[str, Any],
     model: str,
@@ -249,7 +267,7 @@ def _apply_provider_cache_hints(
 ) -> None:
     """Inject the provider-appropriate cache hint into outbound kwargs.
 
-    Two cache channels exist, dispatched by provider:
+    Provider-specific request hints are dispatched here after agent extras merge:
 
     * **Anthropic** — content-block ``cache_control`` markers, set by
       :func:`inject_cache_breakpoints` directly on the messages list.
@@ -263,6 +281,8 @@ def _apply_provider_cache_hints(
       eligibility. The natural per-session scope keeps successive turns
       of the same session in the same bucket while distinct sessions
       don't collide.
+    * **xAI Grok** — ``x-grok-conv-id`` in ``extra_headers``.  xAI uses this
+      stable per-session conversation identity to improve cache affinity.
 
     Skips when ``session_id`` is unset — a caller that doesn't know the
     session (rare; only the harness's two call sites invoke these
@@ -283,6 +303,16 @@ def _apply_provider_cache_hints(
     if _supports_openai_prompt_cache_key(model):
         extra_body = kwargs.setdefault("extra_body", {})
         extra_body.setdefault("prompt_cache_key", session_id)
+    if _supports_xai_conversation_id(model):
+        # Clone rather than mutate the nested mapping from agent.litellm_extra.
+        # Keep every agent-provided sibling header, while making this one
+        # provider contract authoritative and case-insensitively unique.
+        extra_headers = dict(kwargs.get("extra_headers") or {})
+        for name in tuple(extra_headers):
+            if name.lower() == _XAI_CONVERSATION_HEADER:
+                del extra_headers[name]
+        extra_headers[_XAI_CONVERSATION_HEADER] = session_id
+        kwargs["extra_headers"] = extra_headers
 
 
 def inject_cache_breakpoints(
@@ -429,14 +459,33 @@ def estimate_cost_usd(model: str, usage: dict[str, int]) -> float | None:
     return float(prompt_cost) + float(completion_cost)
 
 
-def _extract_cost(response: Any) -> float | None:
-    """Pull the per-request USD cost LiteLLM computes post-call.
+def _extract_billed_cost_usd(response: Any) -> float | None:
+    """Return xAI's exact billed ticks when present on a response/chunk."""
+    usage = response.get("usage") if hasattr(response, "get") else getattr(response, "usage", None)
+    if usage is not None:
+        ticks = (
+            usage.get("cost_in_usd_ticks")
+            if hasattr(usage, "get")
+            else getattr(usage, "cost_in_usd_ticks", None)
+        )
+        if isinstance(ticks, (int, float)) and not isinstance(ticks, bool) and ticks >= 0:
+            return float(ticks) / _USD_TICKS_PER_USD
+    return None
 
-    LiteLLM populates ``response._hidden_params["response_cost"]`` during
-    its logging pipeline. Missing attribute, missing key, or ``None``
-    value all mean the provider didn't report cost — the harness passes
-    ``None`` through rather than guessing.
+
+def _extract_cost(response: Any) -> float | None:
+    """Pull exact provider cost, falling back to LiteLLM's estimate.
+
+    xAI includes ``usage.cost_in_usd_ticks`` in Chat Completions responses,
+    where one USD is exactly 10^10 ticks. Prefer that billed value over
+    LiteLLM's hidden ``response_cost`` estimate. Streaming callers also
+    capture this value directly from chunks because LiteLLM may omit the
+    provider extension while assembling its final response.
     """
+    billed_cost = _extract_billed_cost_usd(response)
+    if billed_cost is not None:
+        return billed_cost
+
     hidden = getattr(response, "_hidden_params", None)
     if not hidden:
         return None
@@ -631,6 +680,10 @@ async def stream_litellm(
     # defeating ``loop.REFUSAL_FINISH_REASON`` gating on the streaming path.
     # Make it sticky: once seen on the wire, override the assembled value.
     saw_content_filter = False
+    # LiteLLM's stream assembler does not preserve provider-specific usage
+    # extensions consistently. xAI reports a running billed-ticks total on
+    # usage chunks, so retain the latest exact value directly off the wire.
+    billed_cost: float | None = None
     try:
         while True:
             guard_timeout = _STREAM_TTFT_TIMEOUT_S if first else _STREAM_INTER_CHUNK_TIMEOUT_S
@@ -648,6 +701,8 @@ async def stream_litellm(
                             _, usage, cost, _ = _unpack_litellm_response(
                                 partial_assembled, source="stream_chunk_builder"
                             )
+                            if billed_cost is not None:
+                                cost = billed_cost
                     raise ModelCallDeadlineError(
                         f"model call exceeded its {deadline_s:.0f}s total deadline while still streaming",
                         usage=usage,
@@ -659,6 +714,9 @@ async def stream_litellm(
                 break
             first = False
             chunks.append(chunk)
+            chunk_billed_cost = _extract_billed_cost_usd(chunk)
+            if chunk_billed_cost is not None:
+                billed_cost = chunk_billed_cost
             # Some providers (OpenRouter, Grok, vLLM, OpenAI with stream_options.
             # include_usage) emit a terminal usage-summary chunk with empty choices.
             if not chunk.choices:
@@ -702,6 +760,8 @@ async def stream_litellm(
     message, usage, cost, finish_reason = _unpack_litellm_response(
         assembled, source="stream_chunk_builder"
     )
+    if billed_cost is not None:
+        cost = billed_cost
     # Restore a refusal that stream_chunk_builder's last-wins loop clobbered
     # (see ``saw_content_filter`` above). Zero behavior change on the happy
     # path: only fires when the wire actually carried a ``content_filter``.

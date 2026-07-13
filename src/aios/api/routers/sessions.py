@@ -509,11 +509,12 @@ async def post_message(
                     f"on this session; omit metadata.channel to inject as a "
                     f"global-inbox event"
                 )
-    event = await service.append_user_message(
+    result = await service.append_user_message_with_status(
         pool, session_id, body.content, metadata=metadata, account_id=account_id
     )
-    await defer_wake(pool, session_id, cause="message", account_id=account_id)
-    return event
+    if result.created:
+        await defer_wake(pool, session_id, cause="message", account_id=account_id)
+    return result.event
 
 
 @router.post("/{session_id}/interrupt", operation_id="interrupt_session")

@@ -408,6 +408,38 @@ async def find_tool_result_event(
     return _row_to_event(row) if row is not None else None
 
 
+async def find_user_message_by_client_message_id(
+    conn: asyncpg.Connection[Any],
+    session_id: str,
+    client_message_id: str,
+    *,
+    account_id: str,
+) -> Event | None:
+    """Return the user event carrying a canonical client message UUID.
+
+    The predicate mirrors migration 0113's partial unique index so retries are
+    an indexed lookup and the database remains the structural concurrency
+    floor for ``(account_id, session_id, client_message_id)``.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM events
+         WHERE account_id = $1
+           AND session_id = $2
+           AND kind = 'message'
+           AND role = 'user'
+           AND data->'metadata'->>'client_message_id' = $3
+           AND data->'metadata'->>'client_message_id'
+               ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+         LIMIT 1
+        """,
+        account_id,
+        session_id,
+        client_message_id,
+    )
+    return _row_to_event(row) if row is not None else None
+
+
 async def find_tool_confirmed_event(
     conn: asyncpg.Connection[Any],
     session_id: str,
