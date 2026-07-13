@@ -99,6 +99,13 @@ class ForbiddenError(AiosError):
     status_code = 403
 
 
+class AccountPurgeIncompleteError(AiosError):
+    """The DB purge committed but durable external cleanup needs a retry."""
+
+    error_type = "account_purge_incomplete"
+    status_code = 500
+
+
 class RateLimitedError(AiosError):
     """A resource-cap ceiling was reached.
 

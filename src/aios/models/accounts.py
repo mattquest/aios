@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -160,3 +160,56 @@ class UpdateAccountRequest(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=128)
     can_mint_children: bool | None = None
     config: AccountConfig | None = None
+
+
+AccountPurgeMode = Literal["strict", "cascade"]
+
+
+class AccountCascadePurgeSessionArtifact(BaseModel):
+    """Session-owned host state retained until cascade cleanup completes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    workspace_volume_path: str
+
+
+class AccountCascadePurgeConnectionArtifact(BaseModel):
+    """Fields required to replay a connection ``removed`` notification."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    connector: str
+    external_account_id: str
+
+
+class AccountCascadePurgeManifest(BaseModel):
+    """Crash-recoverable external cleanup and invalidation manifest."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal[1] = 1
+    target_account_id: str
+    sessions: list[AccountCascadePurgeSessionArtifact]
+    workflow_run_ids: list[str]
+    memory_store_ids: list[str]
+    vault_ids: list[str]
+    connections: list[AccountCascadePurgeConnectionArtifact]
+    trigger_ids: list[str]
+
+
+class AccountCascadePurgeReceipt(BaseModel):
+    """Internal durable state for an exact root/child cascade retry."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    target_account_id: str
+    caller_account_id: str
+    manifest: AccountCascadePurgeManifest | None
+    cleanup_attempts: int
+    last_cleanup_error: str | None
+    created_at: datetime
+    db_purged_at: datetime
+    cleanup_completed_at: datetime | None
+    updated_at: datetime

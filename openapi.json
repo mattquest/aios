@@ -521,7 +521,7 @@
           "accounts"
         ],
         "summary": "Purge Account",
-        "description": "Hard-delete a direct child that has already been soft-archived.\n\nTwo-step ceremony:     1. ``DELETE /v1/accounts/{id}`` soft-archives (sets ``archived_at``).    2. ``POST /v1/accounts/{id}/purge`` hard-deletes the row.\n\nRefuses with 409 if the account is not yet archived, has non-archived\nchildren, has any resources (FK RESTRICT will refuse the DELETE), or\nis the caller's own account. Compliance / GDPR path; the normal\nlifecycle stops at archive.",
+        "description": "Hard-delete a direct child that has already been soft-archived.\n\nTwo-step ceremony:     1. ``DELETE /v1/accounts/{id}`` soft-archives (sets ``archived_at``).    2. ``POST /v1/accounts/{id}/purge`` hard-deletes the row.\n\n``mode=strict`` is the legacy default: it refuses populated accounts and\nallows any direct parent. ``mode=cascade`` is root-only and durably erases\na childless direct child's database resources and canonical host artifacts;\nexact retries resume a stored cleanup receipt after partial failure.",
         "operationId": "purge_account",
         "parameters": [
           {
@@ -531,6 +531,20 @@
             "schema": {
               "type": "string",
               "title": "Target Id"
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strict",
+                "cascade"
+              ],
+              "type": "string",
+              "default": "strict",
+              "title": "Mode"
             }
           },
           {

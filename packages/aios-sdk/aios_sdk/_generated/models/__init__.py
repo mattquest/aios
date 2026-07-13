@@ -152,6 +152,7 @@ from .post_connector_runtime_lifecycle_response_post_connector_runtime_lifecycle
 from .post_connector_runtime_session_lifecycle_response_post_connector_runtime_session_lifecycle import (
     PostConnectorRuntimeSessionLifecycleResponsePostConnectorRuntimeSessionLifecycle,
 )
+from .purge_account_mode import PurgeAccountMode
 from .recent_chat import RecentChat
 from .run_completion_source import RunCompletionSource
 from .run_completion_source_replace import RunCompletionSourceReplace
@@ -452,6 +453,7 @@ __all__ = (
     "PostConnectorRuntimeChatLifecycleResponsePostConnectorRuntimeChatLifecycle",
     "PostConnectorRuntimeLifecycleResponsePostConnectorRuntimeLifecycle",
     "PostConnectorRuntimeSessionLifecycleResponsePostConnectorRuntimeSessionLifecycle",
+    "PurgeAccountMode",
     "RecentChat",
     "RunCompletionSource",
     "RunCompletionSourceReplace",

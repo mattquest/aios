@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, Header, status
+from fastapi import APIRouter, Header, Query, status
 
 from aios.api.deps import AuthDep, PoolDep, _extract_bearer_token
 from aios.config import get_settings
@@ -15,6 +15,7 @@ from aios.logging import get_logger
 from aios.models.accounts import (
     Account,
     AccountKeySummary,
+    AccountPurgeMode,
     AccountUsage,
     BootstrapRequest,
     BootstrapResponse,
@@ -217,26 +218,36 @@ async def archive_account(target_id: str, pool: PoolDep, auth: AuthDep) -> Accou
     operation_id="purge_account",
     status_code=status.HTTP_204_NO_CONTENT,
 )
-async def purge_account(target_id: str, pool: PoolDep, auth: AuthDep) -> None:
+async def purge_account(
+    target_id: str,
+    pool: PoolDep,
+    auth: AuthDep,
+    mode: Annotated[AccountPurgeMode, Query()] = "strict",
+) -> None:
     """Hard-delete a direct child that has already been soft-archived.
 
     Two-step ceremony: \
     1. ``DELETE /v1/accounts/{id}`` soft-archives (sets ``archived_at``).\
     2. ``POST /v1/accounts/{id}/purge`` hard-deletes the row.
 
-    Refuses with 409 if the account is not yet archived, has non-archived
-    children, has any resources (FK RESTRICT will refuse the DELETE), or
-    is the caller's own account. Compliance / GDPR path; the normal
-    lifecycle stops at archive.
+    ``mode=strict`` is the legacy default: it refuses populated accounts and
+    allows any direct parent. ``mode=cascade`` is root-only and durably erases
+    a childless direct child's database resources and canonical host artifacts;
+    exact retries resume a stored cleanup receipt after partial failure.
     """
     account_id, key_id, _can_mint = auth
-    await service.purge_account(pool, target_account_id=target_id, caller_account_id=account_id)
+    await service.purge_account(
+        pool,
+        target_account_id=target_id,
+        caller_account_id=account_id,
+        mode=mode,
+    )
     log.info(
         "account.operation",
         actor_account_id=account_id,
         actor_key_id=key_id,
         target_account_id=target_id,
-        action="account.purge",
+        action=f"account.purge.{mode}",
         outcome="success",
     )
 

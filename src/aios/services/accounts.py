@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 from typing import Any, cast
@@ -11,17 +12,25 @@ import asyncpg
 
 from aios.config import get_settings
 from aios.db import queries
-from aios.errors import ConflictError, ForbiddenError, NotFoundError
+from aios.errors import (
+    AccountPurgeIncompleteError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+)
 from aios.logging import get_logger
 from aios.models.accounts import (
     Account,
+    AccountCascadePurgeManifest,
     AccountConfig,
     AccountKeySummary,
+    AccountPurgeMode,
     AccountUsage,
     BootstrapResponse,
     MintAccountResponse,
     MintKeyResponse,
 )
+from aios.services import account_purge
 
 log = get_logger("aios.services.accounts")
 
@@ -350,8 +359,146 @@ async def get_account_subtree_spend_state(
     return spent, limit
 
 
-async def purge_account(
+async def _resume_account_cascade_cleanup(
     pool: asyncpg.Pool[Any], *, target_account_id: str, caller_account_id: str
+) -> None:
+    """Run one serialized, replay-safe cleanup attempt from its durable receipt."""
+    async with pool.acquire() as conn:
+        await queries.acquire_account_cascade_cleanup_lock(conn, target_account_id)
+        try:
+            receipt = await queries.get_account_cascade_purge_receipt(conn, target_account_id)
+            if receipt is None or receipt.caller_account_id != caller_account_id:
+                raise NotFoundError(
+                    f"account {target_account_id} not found",
+                    detail={"id": target_account_id},
+                )
+            if receipt.cleanup_completed_at is not None:
+                return
+            manifest = receipt.manifest
+            if manifest is None:
+                raise AccountPurgeIncompleteError(
+                    "cascade purge receipt has no cleanup manifest",
+                    detail={"account_id": target_account_id, "retryable": False},
+                )
+            await queries.begin_account_cascade_cleanup_attempt(conn, target_account_id)
+            try:
+                await account_purge.emit_account_purge_invalidations(conn, manifest)
+                await asyncio.to_thread(account_purge.purge_account_host_artifacts, manifest)
+            except Exception as exc:
+                await queries.record_account_cascade_cleanup_error(
+                    conn, target_account_id, type(exc).__name__
+                )
+                log.exception(
+                    "account.cascade_purge_cleanup_failed",
+                    target_account_id=target_account_id,
+                    error_kind=type(exc).__name__,
+                )
+                raise AccountPurgeIncompleteError(
+                    "database purge completed but external cleanup needs a retry",
+                    detail={
+                        "account_id": target_account_id,
+                        "retryable": True,
+                        "retry": f"POST /v1/accounts/{target_account_id}/purge?mode=cascade",
+                    },
+                ) from exc
+            await queries.complete_account_cascade_cleanup(conn, target_account_id)
+        finally:
+            await queries.release_account_cascade_cleanup_lock(conn, target_account_id)
+
+
+async def _cascade_purge_account(
+    pool: asyncpg.Pool[Any], *, target_account_id: str, caller_account_id: str
+) -> None:
+    """Root-authorized durable purge of one archived, childless direct child."""
+    if target_account_id == caller_account_id:
+        raise ConflictError(
+            "an account cannot purge itself via the management API",
+            detail={"account_id": caller_account_id},
+        )
+
+    blocked_manifest: AccountCascadePurgeManifest | None = None
+    doing_jobs: list[int] = []
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            caller = await queries.get_account_for_update(conn, caller_account_id)
+            if caller is None:
+                raise NotFoundError(
+                    f"account {caller_account_id} not found",
+                    detail={"id": caller_account_id},
+                )
+            if caller.parent_account_id is not None:
+                raise ForbiddenError(
+                    "cascade purge is restricted to the root account",
+                    detail={"account_id": caller_account_id},
+                )
+
+            receipt = await queries.get_account_cascade_purge_receipt(conn, target_account_id)
+            if receipt is not None:
+                if receipt.caller_account_id != caller_account_id:
+                    raise NotFoundError(
+                        f"account {target_account_id} not found",
+                        detail={"id": target_account_id},
+                    )
+            else:
+                target = await queries.get_account_for_update(conn, target_account_id)
+                if target is None or target.parent_account_id != caller_account_id:
+                    raise NotFoundError(
+                        f"account {target_account_id} not found",
+                        detail={"id": target_account_id},
+                    )
+                if target.archived_at is None:
+                    raise ConflictError(
+                        f"account {target_account_id} is not archived; "
+                        "soft-archive (DELETE /v1/accounts/{id}) before purging",
+                        detail={"account_id": target_account_id},
+                    )
+                children = await queries.count_child_accounts(conn, target_account_id)
+                if children:
+                    raise ConflictError(
+                        f"account {target_account_id} has {children} children; purge them first",
+                        detail={"account_id": target_account_id, "children": children},
+                    )
+                manifest = await queries.build_account_cascade_purge_manifest(
+                    conn, target_account_id
+                )
+                doing_jobs = await queries.lock_and_cancel_queued_account_jobs(conn, manifest)
+                if doing_jobs:
+                    blocked_manifest = manifest
+                else:
+                    await queries.insert_account_cascade_purge_receipt(
+                        conn, caller_account_id=caller_account_id, manifest=manifest
+                    )
+                    await queries.cascade_hard_delete_account_resources(conn, target_account_id)
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise ConflictError(
+            "account cannot be cascade-purged while an unhandled resource references it",
+            detail={"account_id": target_account_id},
+        ) from exc
+
+    if doing_jobs:
+        assert blocked_manifest is not None
+        await account_purge.interrupt_account_sessions(pool, blocked_manifest)
+        raise ConflictError(
+            "account has active jobs; retry after they reach quiescence",
+            detail={
+                "account_id": target_account_id,
+                "active_job_count": len(doing_jobs),
+                "retryable": True,
+            },
+        )
+    await _resume_account_cascade_cleanup(
+        pool,
+        target_account_id=target_account_id,
+        caller_account_id=caller_account_id,
+    )
+
+
+async def purge_account(
+    pool: asyncpg.Pool[Any],
+    *,
+    target_account_id: str,
+    caller_account_id: str,
+    mode: AccountPurgeMode = "strict",
 ) -> None:
     """Hard-delete a direct child of the caller. Refuses if not archived.
 
@@ -364,6 +511,14 @@ async def purge_account(
     The caller can't purge itself: top-level purges are operator-side
     DB work, not a management API responsibility.
     """
+    if mode == "cascade":
+        await _cascade_purge_account(
+            pool,
+            target_account_id=target_account_id,
+            caller_account_id=caller_account_id,
+        )
+        return
+
     if target_account_id == caller_account_id:
         raise ConflictError(
             "an account cannot purge itself via the management API",

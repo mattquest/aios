@@ -27,8 +27,53 @@ from aios.ids import (
     RUNTIME_TOKEN,
     make_id,
 )
-from aios.models.accounts import Account, AccountConfig
+from aios.models.accounts import (
+    Account,
+    AccountCascadePurgeConnectionArtifact,
+    AccountCascadePurgeManifest,
+    AccountCascadePurgeReceipt,
+    AccountCascadePurgeSessionArtifact,
+    AccountConfig,
+)
 from aios.models.runtime_tokens import RuntimeToken
+
+_ACCOUNT_CASCADE_DELETE_TABLES: tuple[str, ...] = (
+    "connector_inbound_acks",
+    "trigger_runs",
+    "triggers",
+    "wf_run_vaults",
+    "oauth_flows",
+    "wf_runs",
+    "workflow_versions",
+    "workflows",
+    "routing_rules",
+    "bindings",
+    "chat_sessions",
+    "events",
+    "files",
+    "session_github_repositories",
+    "session_memory_stores",
+    "session_vaults",
+    "sessions",
+    "connections",
+    "vault_credentials",
+    "vaults",
+    "memories",
+    "memory_versions",
+    "memory_stores",
+    "skill_versions",
+    "skills",
+    "session_templates",
+    "agent_versions",
+    "agents",
+    "environments",
+    "runtime_tokens",
+    "runtimes",
+    "pending_management_calls",
+    "inbound_acks",
+    "credentials",
+    "account_keys",
+)
 
 # ─── runtime_tokens ──────────────────────────────────────────────────────────
 #
@@ -810,6 +855,289 @@ async def hard_delete_account(conn: asyncpg.Connection[Any], account_id: str) ->
         account_id,
     )
     return bool(result.endswith(" 1"))
+
+
+def _row_to_cascade_purge_receipt(row: asyncpg.Record) -> AccountCascadePurgeReceipt:
+    raw_manifest = row["manifest"]
+    manifest = (
+        AccountCascadePurgeManifest.model_validate(parse_jsonb(raw_manifest))
+        if raw_manifest is not None
+        else None
+    )
+    return AccountCascadePurgeReceipt(
+        target_account_id=row["target_account_id"],
+        caller_account_id=row["caller_account_id"],
+        manifest=manifest,
+        cleanup_attempts=row["cleanup_attempts"],
+        last_cleanup_error=row["last_cleanup_error"],
+        created_at=row["created_at"],
+        db_purged_at=row["db_purged_at"],
+        cleanup_completed_at=row["cleanup_completed_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+async def get_account_for_update(conn: asyncpg.Connection[Any], account_id: str) -> Account | None:
+    """Read and row-lock an account for a destructive lifecycle operation."""
+    row = await conn.fetchrow("SELECT * FROM accounts WHERE id = $1 FOR UPDATE", account_id)
+    return _row_to_account(row) if row is not None else None
+
+
+async def count_child_accounts(conn: asyncpg.Connection[Any], parent_account_id: str) -> int:
+    """Count every direct child, including archived rows, for hard-delete safety."""
+    count = await conn.fetchval(
+        "SELECT count(*) FROM accounts WHERE parent_account_id = $1",
+        parent_account_id,
+    )
+    return int(count or 0)
+
+
+async def get_account_cascade_purge_receipt(
+    conn: asyncpg.Connection[Any], target_account_id: str
+) -> AccountCascadePurgeReceipt | None:
+    row = await conn.fetchrow(
+        "SELECT * FROM account_cascade_purge_receipts WHERE target_account_id = $1",
+        target_account_id,
+    )
+    return _row_to_cascade_purge_receipt(row) if row is not None else None
+
+
+async def acquire_account_cascade_cleanup_lock(
+    conn: asyncpg.Connection[Any], target_account_id: str
+) -> None:
+    """Serialize external cleanup retries for one target across processes."""
+    await conn.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", target_account_id)
+
+
+async def release_account_cascade_cleanup_lock(
+    conn: asyncpg.Connection[Any], target_account_id: str
+) -> None:
+    """Release the session-scoped cleanup lock acquired above."""
+    await conn.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", target_account_id)
+
+
+async def build_account_cascade_purge_manifest(
+    conn: asyncpg.Connection[Any], target_account_id: str
+) -> AccountCascadePurgeManifest:
+    """Capture every id needed for quiescence, cleanup, and invalidation."""
+    session_rows = await conn.fetch(
+        "SELECT id, workspace_volume_path FROM sessions WHERE account_id = $1 ORDER BY id",
+        target_account_id,
+    )
+    run_ids = await conn.fetch(
+        "SELECT id FROM wf_runs WHERE account_id = $1 ORDER BY id",
+        target_account_id,
+    )
+    memory_store_ids = await conn.fetch(
+        "SELECT id FROM memory_stores WHERE account_id = $1 ORDER BY id",
+        target_account_id,
+    )
+    vault_ids = await conn.fetch(
+        "SELECT id FROM vaults WHERE account_id = $1 ORDER BY id",
+        target_account_id,
+    )
+    connection_rows = await conn.fetch(
+        "SELECT id, connector, external_account_id FROM connections "
+        "WHERE account_id = $1 ORDER BY id",
+        target_account_id,
+    )
+    trigger_ids = await conn.fetch(
+        "SELECT id FROM triggers WHERE account_id = $1 ORDER BY id",
+        target_account_id,
+    )
+    return AccountCascadePurgeManifest(
+        target_account_id=target_account_id,
+        sessions=[
+            AccountCascadePurgeSessionArtifact(
+                id=row["id"],
+                workspace_volume_path=row["workspace_volume_path"],
+            )
+            for row in session_rows
+        ],
+        workflow_run_ids=[row["id"] for row in run_ids],
+        memory_store_ids=[row["id"] for row in memory_store_ids],
+        vault_ids=[row["id"] for row in vault_ids],
+        connections=[
+            AccountCascadePurgeConnectionArtifact(
+                id=row["id"],
+                connector=row["connector"],
+                external_account_id=row["external_account_id"],
+            )
+            for row in connection_rows
+        ],
+        trigger_ids=[row["id"] for row in trigger_ids],
+    )
+
+
+async def lock_and_cancel_queued_account_jobs(
+    conn: asyncpg.Connection[Any], manifest: AccountCascadePurgeManifest
+) -> list[int]:
+    """Delete queued target jobs and return in-flight job ids.
+
+    Matching rows are locked before classification, closing the worker-claim
+    race. A non-empty return requires the caller to roll back and report the
+    verified-quiescence conflict after committing queued cancellations;
+    already-running cross-process work cannot be made safe by mutating its
+    queue row.
+    """
+    if await conn.fetchval("SELECT to_regclass('procrastinate_jobs')") is None:
+        return []
+    session_ids = [item.id for item in manifest.sessions]
+    run_ids = manifest.workflow_run_ids
+    trigger_ids = manifest.trigger_ids
+    rows = await conn.fetch(
+        """
+        SELECT id, status
+          FROM procrastinate_jobs
+         WHERE status IN ('todo', 'doing')
+           AND (
+                (task_name = 'harness.wake_session'
+                 AND args->>'session_id' = ANY($1::text[]))
+             OR (task_name = 'harness.wake_workflow'
+                 AND args->>'run_id' = ANY($2::text[]))
+             OR (task_name IN ('harness.run_trigger', 'harness.run_scheduled_task')
+                 AND args->>'trigger_id' = ANY($3::text[]))
+           )
+         FOR UPDATE
+        """,
+        session_ids,
+        run_ids,
+        trigger_ids,
+    )
+    doing = [int(row["id"]) for row in rows if row["status"] == "doing"]
+    todo = [int(row["id"]) for row in rows if row["status"] == "todo"]
+    if todo:
+        await conn.execute("DELETE FROM procrastinate_jobs WHERE id = ANY($1::bigint[])", todo)
+    return doing
+
+
+async def insert_account_cascade_purge_receipt(
+    conn: asyncpg.Connection[Any],
+    *,
+    caller_account_id: str,
+    manifest: AccountCascadePurgeManifest,
+) -> AccountCascadePurgeReceipt:
+    row = await conn.fetchrow(
+        """
+        INSERT INTO account_cascade_purge_receipts
+            (target_account_id, caller_account_id, manifest)
+        VALUES ($1, $2, $3::jsonb)
+        RETURNING *
+        """,
+        manifest.target_account_id,
+        caller_account_id,
+        manifest.model_dump_json(),
+    )
+    assert row is not None
+    return _row_to_cascade_purge_receipt(row)
+
+
+async def cascade_hard_delete_account_resources(
+    conn: asyncpg.Connection[Any], target_account_id: str
+) -> None:
+    """Archive/cancel, then hard-delete every current account-owned DB row.
+
+    The caller owns the transaction and has row-locked the archived account.
+    The final account DELETE is a future-schema safety floor: an omitted new
+    RESTRICT resource aborts and rolls back the entire purge.
+    """
+    await conn.execute(
+        "UPDATE triggers SET enabled = FALSE WHERE account_id = $1",
+        target_account_id,
+    )
+    for table in (
+        "sessions",
+        "agents",
+        "environments",
+        "vault_credentials",
+        "vaults",
+        "memory_stores",
+        "skills",
+        "session_templates",
+        "connections",
+        "credentials",
+        "workflows",
+    ):
+        await conn.execute(
+            f"UPDATE {table} SET archived_at = COALESCE(archived_at, now()) WHERE account_id = $1",
+            target_account_id,
+        )
+    await conn.execute(
+        "UPDATE wf_runs SET status = 'cancelled', updated_at = now() "
+        "WHERE account_id = $1 AND status IN ('pending', 'running', 'suspended')",
+        target_account_id,
+    )
+
+    for table in _ACCOUNT_CASCADE_DELETE_TABLES:
+        await conn.execute(
+            f"DELETE FROM {table} WHERE account_id = $1",
+            target_account_id,
+        )
+
+    # ``connectors`` is a global type catalog (0044), never a tenant resource.
+    # Clear only the obsolete nullable ownership carrier left by 0043.
+    await conn.execute(
+        "UPDATE connectors SET account_id = NULL WHERE account_id = $1",
+        target_account_id,
+    )
+    result = await conn.execute(
+        "DELETE FROM accounts WHERE id = $1 AND archived_at IS NOT NULL",
+        target_account_id,
+    )
+    if not result.endswith(" 1"):
+        raise ConflictError(
+            f"account {target_account_id} was not deleted",
+            detail={"account_id": target_account_id},
+        )
+
+
+async def begin_account_cascade_cleanup_attempt(
+    conn: asyncpg.Connection[Any], target_account_id: str
+) -> None:
+    await conn.execute(
+        """
+        UPDATE account_cascade_purge_receipts
+           SET cleanup_attempts = cleanup_attempts + 1,
+               last_cleanup_error = NULL,
+               updated_at = now()
+         WHERE target_account_id = $1
+           AND cleanup_completed_at IS NULL
+        """,
+        target_account_id,
+    )
+
+
+async def record_account_cascade_cleanup_error(
+    conn: asyncpg.Connection[Any], target_account_id: str, error_kind: str
+) -> None:
+    await conn.execute(
+        """
+        UPDATE account_cascade_purge_receipts
+           SET last_cleanup_error = $2,
+               updated_at = now()
+         WHERE target_account_id = $1
+           AND cleanup_completed_at IS NULL
+        """,
+        target_account_id,
+        error_kind,
+    )
+
+
+async def complete_account_cascade_cleanup(
+    conn: asyncpg.Connection[Any], target_account_id: str
+) -> None:
+    await conn.execute(
+        """
+        UPDATE account_cascade_purge_receipts
+           SET manifest = NULL,
+               last_cleanup_error = NULL,
+               cleanup_completed_at = now(),
+               updated_at = now()
+         WHERE target_account_id = $1
+           AND cleanup_completed_at IS NULL
+        """,
+        target_account_id,
+    )
 
 
 async def sum_account_session_tokens(
