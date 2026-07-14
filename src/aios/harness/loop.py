@@ -155,6 +155,26 @@ def _force_conversational_recovery(
     return recovered
 
 
+def _latest_user_tool_mode(events: list[Any]) -> str:
+    """Return the latest user's safe, attenuating per-message tool mode.
+
+    Message metadata is caller-controlled, so only ``none`` is honored. It can
+    remove capability for one inference but can never grant a tool the agent
+    does not already have.
+    """
+    for event in reversed(events):
+        if getattr(event, "kind", None) != "message":
+            continue
+        data = getattr(event, "data", None)
+        if not isinstance(data, dict) or data.get("role") != "user":
+            continue
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("tool_mode") == "none":
+            return "none"
+        return "auto"
+    return "auto"
+
+
 def _limit_to_microusd(limit_usd: float | None) -> int | None:
     if limit_usd is None:
         return None
@@ -566,6 +586,14 @@ async def _run_session_step_body(
 
     messages = step_ctx.messages
     tools = step_ctx.tools
+    user_tool_mode = _latest_user_tool_mode(events)
+    if user_tool_mode == "none":
+        tools = []
+        log.info(
+            "step.user_tools_attenuated",
+            session_id=session_id,
+            mode=user_tool_mode,
+        )
     tool_rounds = _tool_rounds_since_last_user(messages)
     if tool_rounds >= _MAX_TOOL_ROUNDS_PER_USER_TURN:
         messages = _force_conversational_recovery(messages)
