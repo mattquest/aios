@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Any
 
 from aios.harness.loop import (
     _MAX_TOOL_ROUNDS_PER_USER_TURN,
@@ -9,7 +10,7 @@ from aios.harness.loop import (
 )
 
 
-def _assistant_tool(round_number: int) -> dict:
+def _assistant_tool(round_number: int) -> dict[str, Any]:
     return {
         "role": "assistant",
         "content": None,
@@ -18,7 +19,7 @@ def _assistant_tool(round_number: int) -> dict:
 
 
 def test_tool_round_budget_counts_rounds_not_parallel_calls() -> None:
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": "coach"},
         {"role": "user", "content": "Build a workout"},
         {

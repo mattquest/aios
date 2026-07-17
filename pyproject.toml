@@ -39,7 +39,10 @@ dependencies = [
     "cryptography>=46",         # egress-CA x509 cert + EC key (sandbox/egress_ca.py)
     "python-ulid>=3.0",
     # LLM client
-    "litellm>=1.55",
+    # <1.92: 1.92.0 dropped the pure-python wheel (manylinux-only native
+    # build; no macOS wheel, sdist needs a Rust toolchain). 1.91.3 clears
+    # the proxy-code criticals flagged by grype (fixed <1.84 / <1.83.10).
+    "litellm>=1.91.3,<1.92",
     # MCP client + server reflection
     "mcp>=1.20",
     "fastapi-mcp>=0.4",

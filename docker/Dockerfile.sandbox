@@ -45,6 +45,7 @@ FROM python:3.13-slim-bookworm
 # If you customize the sandbox image and only use unrestricted networking,
 # you can omit it.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         coreutils \

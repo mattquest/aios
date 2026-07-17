@@ -51,7 +51,7 @@ _FABLE5_MODEL_COST = {
 for _fable5_key in ("claude-fable-5", "anthropic/claude-fable-5"):
     litellm.model_cost.setdefault(_fable5_key, _FABLE5_MODEL_COST)
 
-# LiteLLM 1.83.4's Anthropic adapter silently DROPS a requested ``thinking``
+# LiteLLM's Anthropic adapter silently DROPS a requested ``thinking``
 # param whenever the last tool-calling assistant message in the replayed
 # history lacks ``thinking_blocks`` (guard for upstream issue #18926). The
 # guard is over-broad: Anthropic accepts a thinking-enabled request against a
@@ -61,8 +61,14 @@ for _fable5_key in ("claude-fable-5", "anthropic/claude-fable-5"):
 # lift + ``_strip_to_spec``'s whitelist now do. Left in place, the guard also
 # creates a bootstrap deadlock: thinking can never turn on for an existing
 # session because no prior turn has thinking blocks, and no turn can produce
-# them while the param keeps being dropped. Neutralize it. Remove when a
-# litellm upgrade narrows the guard upstream.
+# them while the param keeps being dropped. Neutralize it.
+#
+# litellm 1.91.x narrowed the guard (drop now also requires that NO assistant
+# message has thinking blocks, and is gated on ``litellm.modify_params``) —
+# that fixes the ongoing case but NOT the bootstrap case: we set
+# ``modify_params = True`` above, so a session whose history has no thinking
+# blocks yet would still get the param dropped. Keep this patch until the
+# drop path is removed upstream or scoped away from the bootstrap case.
 try:  # defensive: private module path, may move across litellm versions
     from litellm.llms.anthropic.chat import transformation as _anthropic_transformation
 

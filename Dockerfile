@@ -24,6 +24,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # runtime AND the worker uses it at build time to fetch the docker apt
 # keyring; ca-certificates is needed for both.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -105,6 +106,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 
 USER root
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends \
         gnupg \
         git \
