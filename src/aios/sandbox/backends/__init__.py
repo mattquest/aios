@@ -17,5 +17,9 @@ def select_sandbox_backend(settings: Settings) -> SandboxBackend:
             from aios.sandbox.backends.docker import DockerBackend
 
             return DockerBackend()
+        case "disabled":
+            from aios.sandbox.backends.disabled import DisabledBackend
+
+            return DisabledBackend()
         case other:
             raise ValueError(f"unknown AIOS_SANDBOX_BACKEND {other!r}")

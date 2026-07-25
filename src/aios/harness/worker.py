@@ -231,7 +231,8 @@ async def worker_main() -> None:
         sandbox_registry = SandboxRegistry(backend=select_sandbox_backend(settings))
         task_registry = TaskRegistry()
         mcp_session_pool = McpSessionPool()
-        await ensure_sandbox_network()
+        if settings.sandbox_backend != "disabled":
+            await ensure_sandbox_network()
         tool_broker = ToolBroker(socket_path=settings.tool_broker_socket_path)
         await tool_broker.start()
         for broker_task in tool_broker.serve_tasks():
